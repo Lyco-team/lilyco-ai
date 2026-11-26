@@ -11,5 +11,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Check and test AI workspace
-        run: cargo test --workspace
+      - name: Compile all workspace targets including CDP e2e tests
+        run: cargo test --workspace --no-run
+      - name: Run headless unit and integration tests
+        run: |
+          cargo test -p lilyco-aic -p lilyco-bitnet -p lilyco-mpkg
+          cargo test -p lilyco-web2cli --lib
