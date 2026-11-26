@@ -1,0 +1,27 @@
+[package]
+name = "lilyco-deepseek"
+version.workspace = true
+edition = "2021"
+description = "ldeepseek — Drive chat.deepseek.com from CLI / TUI / Web / MCP / OpenAI-compatible HTTP endpoint, powered by lilyco-webchat-core"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Lyco-team/lilyco-ai"
+keywords = ["cli", "mcp", "deepseek", "openai"]
+categories = ["command-line-interface", "development-tools"]
+
+[[bin]]
+name = "ldeepseek"
+path = "src/main.rs"
+
+[dependencies]
+lilyco = { version = "0.3", git = "https://github.com/lilyco-42/lilyco.git", default-features = false }
+lilyco-webchat-core = { path = "../lilyco-webchat-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync"], optional = true }
+async-stream = { version = "0.3", optional = true }
+
+[features]
+default = ["full"]
+full = ["lilyco/full", "server"]
+server = ["dep:axum", "dep:tokio", "dep:async-stream"]

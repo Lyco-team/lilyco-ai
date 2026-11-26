@@ -9,8 +9,10 @@ Lilyco AI & agent domain suite: aic, chatgpt, bitnet, mpkg memory packages & web
 - `lilyco-aic`
 - `lilyco-bitnet`
 - `lilyco-chatgpt`
+- `lilyco-deepseek`
 - `lilyco-mpkg`
 - `lilyco-web2cli`
+- `lilyco-webchat-core`（网页 AI 通用底座：CDP 驱动 / 串行队列 / Bearer 鉴权 / 限流 / 增量续聊 / token 估算）
 
 ## 快速开始
 
