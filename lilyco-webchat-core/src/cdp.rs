@@ -427,6 +427,71 @@ impl Client {
         }))
     }
 
+    /// 截图当前视口到 PNG（用于登录二维码/登录页目检）。
+    /// 纯 CDP，不依赖浏览器控制台或外部工具。
+    pub fn capture_screenshot(&mut self, path: &std::path::Path) -> Result<(), AppError> {
+        let res = self.call(
+            "Page.captureScreenshot",
+            json!({ "format": "png", "captureBeyondViewport": false }),
+        )?;
+        let data = res
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AppError::Runtime("截图响应缺少 data".to_string()))?;
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| AppError::Runtime(format!("解码截图失败: {e}")))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AppError::Runtime(format!("创建截图目录 {} 失败: {e}", parent.display()))
+            })?;
+        }
+        std::fs::write(path, bytes)
+            .map_err(|e| AppError::Runtime(format!("写截图 {} 失败: {e}", path.display())))?;
+        Ok(())
+    }
+
+    /// 清掉某个域名下的所有 cookies（多账号登录前退出现有账号）
+    pub fn clear_cookies_for_domain(&mut self, domain_filter: &str) -> Result<usize, AppError> {
+        let raw = self
+            .call("Storage.getCookies", json!({}))
+            .or_else(|_| self.call("Network.getAllCookies", json!({})))?;
+        let filter = domain_filter.trim().to_ascii_lowercase();
+        let cookies: Vec<Value> = raw
+            .get("cookies")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut removed = 0usize;
+        for c in cookies {
+            let domain = c.get("domain").and_then(Value::as_str).unwrap_or("");
+            if filter.is_empty() || !domain.to_ascii_lowercase().contains(&filter) {
+                continue;
+            }
+            let name = c.get("name").and_then(Value::as_str).unwrap_or("");
+            let path = c.get("path").and_then(Value::as_str).unwrap_or("/");
+            if name.is_empty() {
+                continue;
+            }
+            let _ = self.call(
+                "Network.deleteCookies",
+                json!({ "name": name, "domain": domain, "path": path }),
+            );
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    /// 清掉某个 origin 的 localStorage / sessionStorage / cookies
+    pub fn clear_origin(&mut self, origin: &str) -> Result<(), AppError> {
+        self.call(
+            "Storage.clearDataForOrigin",
+            json!({ "origin": origin, "storageTypes": "all" }),
+        )?;
+        Ok(())
+    }
+
     /// 把导出的 Cookies + localStorage 注入到当前（无头或本机）浏览器实例
     pub fn import_cookies_and_storage(
         &mut self,

@@ -12,6 +12,7 @@ Lilyco AI & agent domain suite: aic, chatgpt, bitnet, mpkg memory packages & web
 - `lilyco-codearts`（华为云码道：模型清单 / OpenAI 兼容网关 / 积分查询 / 每日签到）
 - `lilyco-deepseek`
 - `lilyco-mpkg`
+- `lilyco-webai`（豆包 / 千问 / Kimi / ZCode 的纯 Rust CDP 登录与多账号）
 - `lilyco-web2cli`
 - `lilyco-webchat-core`（网页 AI 通用底座：CDP 驱动 / 串行队列 / Bearer 鉴权 / 限流 / 增量续聊 / token 估算）
 

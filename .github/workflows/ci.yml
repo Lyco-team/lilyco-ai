@@ -17,4 +17,5 @@ jobs:
         run: |
           cargo test -p lilyco-aic -p lilyco-bitnet -p lilyco-mpkg
           cargo test -p lilyco-codearts
+          cargo test -p lilyco-webai -p lilyco-webchat-core
           cargo test -p lilyco-web2cli --lib
