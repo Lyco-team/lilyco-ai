@@ -964,7 +964,14 @@ fn run_in_tab(
     apply_model_and_effort(&mut client, opts.model, opts.effort, ctx)
         .map_err(|e| (true, e))?;
     // 凭证与「发之前的状态快照」都要在**发消息之前**备好：这时候失败还没花掉额度。
-    let creds = refresh::ensure_fresh(auth::load().map_err(|e| (true, e))?);
+    let creds = refresh::ensure_fresh(auth::load().map_err(|e| {
+        (
+            true,
+            AppError::InvalidInput(format!(
+                "chat 额度发完消息需要本地凭证来读回回答（只想用 codex 额度可显式加 --allow-codex）：{e}"
+            )),
+        )
+    })?);
     let api = Api::new(creds);
 
     let (conversation_id, min_branch_len) = if let Some(cid) = opts.conversation_id {
