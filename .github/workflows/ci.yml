@@ -16,4 +16,5 @@ jobs:
       - name: Run headless unit and integration tests
         run: |
           cargo test -p lilyco-aic -p lilyco-bitnet -p lilyco-mpkg
+          cargo test -p lilyco-codearts
           cargo test -p lilyco-web2cli --lib

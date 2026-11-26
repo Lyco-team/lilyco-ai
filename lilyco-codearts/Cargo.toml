@@ -1,0 +1,33 @@
+[package]
+name = "lilyco-codearts"
+version.workspace = true
+edition = "2021"
+description = "lcodearts — 华为云码道（CodeArts Agent）账号后端：模型清单 / OpenAI 兼容网关 / 积分查询 / 每日签到，四端 (CLI / TUI / Web / MCP)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lilyco-42/lilyco-ai"
+keywords = ["cli", "mcp", "codearts", "huaweicloud", "checkin"]
+categories = ["command-line-interface", "development-tools"]
+
+[[bin]]
+name = "lcodearts"
+path = "src/main.rs"
+
+[dependencies]
+# 与 lchatgpt 相同：应用 crate 只依赖 facade
+lilyco = { version = "0.3", git = "https://github.com/lilyco-42/lilyco.git", optional = true, default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 与 lilyco-web2cli / lchatgpt 同一个 HTTP 栈：纯 Rust，不拉 C 工具链
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip", "json"] }
+url = { workspace = true }
+# 华为云 SDK-HMAC-SHA256 只需要 SHA-256 / HMAC / 随机数；ring 已在 workspace 里
+ring = { workspace = true }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "sync", "time"], optional = true }
+async-stream = { version = "0.3", optional = true }
+
+[features]
+default = ["full"]
+full = ["dep:lilyco", "lilyco/full", "server"]
+server = ["dep:axum", "dep:tokio", "dep:async-stream"]
+android = ["dep:lilyco"]

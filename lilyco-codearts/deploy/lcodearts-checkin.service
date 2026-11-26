@@ -1,0 +1,19 @@
+[Unit]
+Description=CodeArts daily check-in (lcodearts)
+Documentation=https://github.com/lilyco-42/lilyco-ai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 需要登录过：lcodearts login
+# 长期无人值守请在下面注入长期 AK/SK（或改用 EnvironmentFile，权限 0600）
+# Environment=LCODEARTS_AK=...
+# Environment=LCODEARTS_SK=...
+# Environment=LCODEARTS_SECURITY_TOKEN=...
+ExecStart=%h/.local/bin/lcodearts checkin --repeat --after-hour 8 --interval 300
+Restart=on-failure
+RestartSec=60
+
+[Install]
+WantedBy=default.target

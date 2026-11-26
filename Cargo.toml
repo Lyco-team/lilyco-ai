@@ -3,6 +3,7 @@ members = [
     "lilyco-aic",
     "lilyco-bitnet",
     "lilyco-chatgpt",
+    "lilyco-codearts",
     "lilyco-deepseek",
     "lilyco-mpkg",
     "lilyco-web2cli",
