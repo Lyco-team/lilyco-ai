@@ -30,13 +30,15 @@
 //! 发 `delta`，所以客户端看到的是粗粒度的增长（约每 1.2 秒一批），不是 token 级流。
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::extract::Path;
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -94,6 +96,21 @@ pub struct Serve {
         default = "low"
     )]
     effort: String,
+    #[arg(
+        about = "Optional Bearer API key required on /v1/* and /images/* (also reads LCHATGPT_SERVE_API_KEY env var; empty means loopback no-auth)",
+        default = ""
+    )]
+    api_key: String,
+    #[arg(
+        about = "Max queued chat/image requests waiting for the serial browser slot (0 means 16; requests beyond this return 429)",
+        default = 0
+    )]
+    max_queue: u16,
+    #[arg(
+        about = "Max /v1/images/generations calls allowed per hour (0 means unlimited)",
+        default = 0
+    )]
+    rate_limit_per_hour: u32,
 }
 
 /// 新开/滚动会话时单条文本的字符上限：超过这个长度会折叠中间历史，
@@ -101,6 +118,10 @@ pub struct Serve {
 const MAX_CHAT_CHARS: usize = 120_000;
 /// 内存里最多记住多少条「客户端会话 → ChatGPT 网页会话」绑定
 const MAX_BOUND_SESSIONS: usize = 64;
+/// 串行队列默认最大排队长度（含正在执行的 1 条）
+const DEFAULT_MAX_QUEUE: usize = 16;
+/// `/v1/quota` 缓存时长，避免网站频繁轮询把 ChatGPT 后端打成 429
+const QUOTA_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// 生图在 /v1/chat/completions 里自动落盘的目录（同时通过 GET /images/<文件名> 提供访问）
 const SERVE_IMAGE_DIR: &str = "/tmp/lchatgpt-images";
@@ -115,13 +136,130 @@ struct BoundSession {
     branch_len: usize,
 }
 
+/// 滑动 1 小时窗口限流器（保护 120 张/24h 的生图配额不被刷爆）
+struct HourlyLimiter {
+    limit: u32,
+    stamps: Mutex<VecDeque<Instant>>,
+}
+
+impl HourlyLimiter {
+    fn new(limit: u32) -> Self {
+        Self {
+            limit,
+            stamps: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// 尝试占一个名额；超限时返回 `Err(还需等待的秒数)`
+    fn try_take(&self) -> Result<(), u64> {
+        let mut q = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let window = Duration::from_secs(3600);
+        while q.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            q.pop_front();
+        }
+        if self.limit > 0 && q.len() >= self.limit as usize {
+            let retry_after = q
+                .front()
+                .map(|oldest| window.saturating_sub(now.duration_since(*oldest)).as_secs().max(1))
+                .unwrap_or(60);
+            return Err(retry_after);
+        }
+        q.push_back(now);
+        Ok(())
+    }
+
+    fn count_last_hour(&self) -> usize {
+        let mut q = self.stamps.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let window = Duration::from_secs(3600);
+        while q.front().is_some_and(|t| now.duration_since(*t) >= window) {
+            q.pop_front();
+        }
+        q.len()
+    }
+}
+
+/// RAII 排队计数守卫：无论任务完成、报错还是客户端提前断开，都会自动减 1
+struct QueueGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// 常量时间字节比对，避免通过响应时间侧信道猜 API Key
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// 校验 `Authorization: Bearer <key>`（未配 api_key 时放行）
+fn check_auth(headers: &HeaderMap, cfg: &Config) -> Result<(), Box<Response>> {
+    let Some(expected) = cfg.api_key.as_deref() else {
+        return Ok(());
+    };
+    let provided = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    if ct_eq(provided.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err(Box::new(api_error(
+            StatusCode::UNAUTHORIZED,
+            "缺少或无效的 Authorization: Bearer <api_key>",
+            "authentication_error",
+        )))
+    }
+}
+
 /// 一个端口进程共享的设置
 struct Config {
     cdp: String,
     allow_codex: bool,
     effort: String,
     base_origin: String,
+    api_key: Option<String>,
+    /// 串行门闩（permits = 1）：同一时刻只允许 1 个浏览器/chat 任务跑，防止多请求抢焦点撞 429
+    chat_gate: Arc<tokio::sync::Semaphore>,
+    queue_depth: Arc<AtomicUsize>,
+    max_queue: usize,
+    image_limiter: HourlyLimiter,
+    quota_cache: Mutex<Option<(Instant, Value)>>,
     sessions: Mutex<HashMap<u64, BoundSession>>,
+}
+
+impl Config {
+    fn enter_chat_queue(&self) -> Result<QueueGuard, Box<Response>> {
+        let prev = self.queue_depth.fetch_add(1, Ordering::SeqCst);
+        let guard = QueueGuard {
+            counter: self.queue_depth.clone(),
+        };
+        if prev >= self.max_queue {
+            drop(guard);
+            return Err(Box::new(api_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "生图/聊天串行队列已满（当前排队 {}/{}），请稍后再试",
+                    prev, self.max_queue
+                ),
+                "queue_full",
+            )));
+        }
+        Ok(guard)
+    }
 }
 
 fn run_serve(app: &Serve, ctx: &Context) -> Result<Value, AppError> {
@@ -137,11 +275,33 @@ fn run_serve(app: &Serve, ctx: &Context) -> Result<Value, AppError> {
     let bind = format!("{host}:{port}");
     // 起步就校验档位：别等第一条 codex 请求才发现拼错了
     let effort = ask::resolve_effort(&app.effort)?;
+    let api_key = {
+        let from_arg = app.api_key.trim().to_string();
+        if !from_arg.is_empty() {
+            Some(from_arg)
+        } else {
+            std::env::var("LCHATGPT_SERVE_API_KEY")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
+    };
+    let max_queue = if app.max_queue == 0 {
+        DEFAULT_MAX_QUEUE
+    } else {
+        app.max_queue as usize
+    };
     let cfg = Arc::new(Config {
         cdp: app.cdp.trim().to_string(),
         allow_codex: app.allow_codex,
         effort,
         base_origin: format!("http://{bind}"),
+        api_key,
+        chat_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+        queue_depth: Arc::new(AtomicUsize::new(0)),
+        max_queue,
+        image_limiter: HourlyLimiter::new(app.rate_limit_per_hour),
+        quota_cache: Mutex::new(None),
         sessions: Mutex::new(HashMap::new()),
     });
 
@@ -181,13 +341,21 @@ fn router(cfg: Arc<Config>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(models))
+        .route("/v1/quota", get(quota_status))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/images/generations", post(images_generations))
         .route("/images/{name}", get(serve_image))
         .with_state(cfg)
 }
 
-async fn serve_image(Path(name): Path<String>) -> Response {
+async fn serve_image(
+    State(cfg): State<Arc<Config>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &cfg) {
+        return *resp;
+    }
     if name.is_empty()
         || name.contains('/')
         || name.contains('\\')
@@ -211,10 +379,79 @@ async fn health(State(cfg): State<Arc<Config>>) -> Json<Value> {
         "service": "lchatgpt",
         "quota": if cfg.allow_codex { "chat+codex" } else { "chat" },
         "models": model_ids(&cfg),
+        "auth_required": cfg.api_key.is_some(),
+        "queue_depth": cfg.queue_depth.load(Ordering::SeqCst),
+        "max_queue": cfg.max_queue,
+        "images_this_hour": cfg.image_limiter.count_last_hour(),
+        "rate_limit_per_hour": cfg.image_limiter.limit,
     }))
 }
 
-async fn models(State(cfg): State<Arc<Config>>) -> Json<Value> {
+/// GET /v1/quota —— 供网站后端监控 `image_gen` 剩余额度与当前排队深度（60 秒缓存，避免刷接口）
+async fn quota_status(State(cfg): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check_auth(&headers, &cfg) {
+        return *resp;
+    }
+    let cached = cfg
+        .quota_cache
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .filter(|(at, _)| at.elapsed() < QUOTA_CACHE_TTL)
+                .map(|(_, v)| v.clone())
+        });
+    let upstream = if let Some(v) = cached {
+        v
+    } else {
+        let fetched = tokio::task::spawn_blocking(|| -> Value {
+            let Ok(creds) = auth::load() else {
+                return json!({ "error": "无法读取本地凭证" });
+            };
+            let api = Api::new(refresh::ensure_fresh(creds));
+            match api.post_json("/conversation/init", &json!({})) {
+                Ok(v) => {
+                    let limits = v
+                        .get("limits_progress")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let image_gen = limits
+                        .iter()
+                        .find(|x| x.get("feature_name").and_then(Value::as_str) == Some("image_gen"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    json!({
+                        "default_model_slug": v.get("default_model_slug").cloned().unwrap_or(Value::Null),
+                        "image_gen": image_gen,
+                        "limits_progress": limits,
+                    })
+                }
+                Err(e) => json!({ "error": format!("{e}") }),
+            }
+        })
+        .await
+        .unwrap_or_else(|e| json!({ "error": format!("{e}") }));
+        if let Ok(mut g) = cfg.quota_cache.lock() {
+            *g = Some((Instant::now(), fetched.clone()));
+        }
+        fetched
+    };
+    Json(json!({
+        "ok": upstream.get("error").is_none(),
+        "queue_depth": cfg.queue_depth.load(Ordering::SeqCst),
+        "max_queue": cfg.max_queue,
+        "images_this_hour": cfg.image_limiter.count_last_hour(),
+        "rate_limit_per_hour": cfg.image_limiter.limit,
+        "upstream": upstream,
+    }))
+    .into_response()
+}
+
+async fn models(State(cfg): State<Arc<Config>>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check_auth(&headers, &cfg) {
+        return *resp;
+    }
     let mut data = vec![json!({
         "id": MODEL_CHAT,
         "object": "model",
@@ -235,7 +472,7 @@ async fn models(State(cfg): State<Arc<Config>>) -> Json<Value> {
             "max_output_tokens": MAX_OUTPUT_TOKENS,
         }));
     }
-    Json(json!({ "object": "list", "data": data }))
+    Json(json!({ "object": "list", "data": data })).into_response()
 }
 
 fn model_ids(cfg: &Config) -> Vec<&'static str> {
@@ -956,7 +1193,14 @@ fn error_response(e: &AppError) -> Response {
 ///
 /// 只回 `b64_json`：后端给的 `download_url` 带签名、且**必须带登录态头**才能
 /// 取，直接甩给客户端是取不到的，所以这里把字节编码进响应体。
-async fn images_generations(State(cfg): State<Arc<Config>>, Json(body): Json<Value>) -> Response {
+async fn images_generations(
+    State(cfg): State<Arc<Config>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &cfg) {
+        return *resp;
+    }
     let prompt = body
         .get("prompt")
         .and_then(Value::as_str)
@@ -983,6 +1227,30 @@ async fn images_generations(State(cfg): State<Arc<Config>>, Json(body): Json<Val
             "invalid_request_error",
         );
     }
+    if let Err(retry_after) = cfg.image_limiter.try_take() {
+        return api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "生图小时限流已满（上限 {}/小时），请约 {} 秒后再试",
+                cfg.image_limiter.limit, retry_after
+            ),
+            "rate_limit_exceeded",
+        );
+    }
+    let _queue_guard = match cfg.enter_chat_queue() {
+        Ok(g) => g,
+        Err(resp) => return *resp,
+    };
+    let _permit = match cfg.chat_gate.clone().acquire_owned().await {
+        Ok(p) => p,
+        Err(_) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "串行队列已关闭",
+                "service_unavailable",
+            )
+        }
+    };
 
     let cfg2 = cfg.clone();
     let joined = tokio::task::spawn_blocking(move || -> Result<Value, AppError> {
@@ -1044,7 +1312,14 @@ enum Part {
     Failed(String),
 }
 
-async fn chat_completions(State(cfg): State<Arc<Config>>, Json(body): Json<Value>) -> Response {
+async fn chat_completions(
+    State(cfg): State<Arc<Config>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &cfg) {
+        return *resp;
+    }
     let asked = body.get("model").and_then(Value::as_str).unwrap_or("");
     let route = match pick_route(asked, &cfg) {
         Ok(r) => r,
@@ -1169,10 +1444,38 @@ async fn chat_completions(State(cfg): State<Arc<Config>>, Json(body): Json<Value
         asked.to_string()
     };
 
+    let is_chat_job = matches!(job, Job::Chat { .. });
+    let queue_guard = if is_chat_job {
+        match cfg.enter_chat_queue() {
+            Ok(g) => Some(g),
+            Err(resp) => return *resp,
+        }
+    } else {
+        None
+    };
+
     if !stream {
-        // 非流式：等全文生成完再一次给出 —— 好处是出错能回真正的 HTTP 状态码
+        // 非流式：等串行门闩拿到后再执行，保证同一时刻只有 1 个浏览器任务
+        let _permit = if is_chat_job {
+            match cfg.chat_gate.clone().acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    return api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "串行队列已关闭",
+                        "service_unavailable",
+                    )
+                }
+            }
+        } else {
+            None
+        };
         let cfg2 = cfg.clone();
-        let joined = tokio::task::spawn_blocking(move || run_job(&cfg2, &job, &mut |_| {})).await;
+        let joined = tokio::task::spawn_blocking(move || {
+            let _hold = (_permit, queue_guard);
+            run_job(&cfg2, &job, &mut |_| {})
+        })
+        .await;
         return match joined {
             Ok(Ok(reply)) => Json(json!({
                 "id": id,
@@ -1198,15 +1501,33 @@ async fn chat_completions(State(cfg): State<Arc<Config>>, Json(body): Json<Value
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Part>(64);
     let cfg2 = cfg.clone();
-    let worker = tokio::task::spawn_blocking(move || {
-        let outcome = run_job(&cfg2, &job, &mut |d| {
-            let _ = tx.blocking_send(Part::Delta(d.to_string()));
-        });
-        let tail = match outcome {
-            Ok(reply) => Part::Done(Box::new(reply)),
-            Err(e) => Part::Failed(format!("{e}")),
+    let gate = cfg.chat_gate.clone();
+    let worker = tokio::spawn(async move {
+        let _guard = queue_guard;
+        let _permit = if is_chat_job {
+            match gate.acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    let _ = tx.send(Part::Failed("串行队列已关闭".to_string())).await;
+                    return;
+                }
+            }
+        } else {
+            None
         };
-        let _ = tx.blocking_send(tail);
+        let tx2 = tx.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            run_job(&cfg2, &job, &mut |d| {
+                let _ = tx2.blocking_send(Part::Delta(d.to_string()));
+            })
+        })
+        .await;
+        let tail = match outcome {
+            Ok(Ok(reply)) => Part::Done(Box::new(reply)),
+            Ok(Err(e)) => Part::Failed(format!("{e}")),
+            Err(e) => Part::Failed(format!("生成线程崩了: {e}")),
+        };
+        let _ = tx.send(tail).await;
     });
 
     let head_id = id.clone();
@@ -1270,6 +1591,12 @@ mod tests {
             allow_codex,
             effort: "low".into(),
             base_origin: "http://127.0.0.1:8790".into(),
+            api_key: None,
+            chat_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            queue_depth: Arc::new(AtomicUsize::new(0)),
+            max_queue: DEFAULT_MAX_QUEUE,
+            image_limiter: HourlyLimiter::new(0),
+            quota_cache: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
         }
     }
@@ -1454,5 +1781,49 @@ mod tests {
         ));
         assert!(!is_image_gen_request("hi"));
         assert!(!is_image_gen_request("帮我写一段 Rust 代码"));
+    }
+
+    #[test]
+    fn api_key_auth_requires_exact_bearer_when_configured() {
+        let mut c = cfg(false);
+        let empty = HeaderMap::new();
+        assert!(check_auth(&empty, &c).is_ok());
+
+        c.api_key = Some("secret-token-123".into());
+        assert!(check_auth(&empty, &c).is_err());
+
+        let mut wrong = HeaderMap::new();
+        wrong.insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert!(check_auth(&wrong, &c).is_err());
+
+        let mut ok_hdr = HeaderMap::new();
+        ok_hdr.insert(
+            header::AUTHORIZATION,
+            "Bearer secret-token-123".parse().unwrap(),
+        );
+        assert!(check_auth(&ok_hdr, &c).is_ok());
+    }
+
+    #[test]
+    fn serial_queue_caps_depth_and_releases_on_drop() {
+        let mut c = cfg(false);
+        c.max_queue = 2;
+        let g1 = c.enter_chat_queue().expect("slot 1");
+        let g2 = c.enter_chat_queue().expect("slot 2");
+        assert!(c.enter_chat_queue().is_err(), "超过 max_queue 必须回 429");
+        assert_eq!(c.queue_depth.load(Ordering::SeqCst), 2);
+        drop(g1);
+        assert_eq!(c.queue_depth.load(Ordering::SeqCst), 1);
+        let _g3 = c.enter_chat_queue().expect("释放后应可再次入队");
+        drop(g2);
+    }
+
+    #[test]
+    fn hourly_limiter_enforces_cap() {
+        let lim = HourlyLimiter::new(2);
+        assert!(lim.try_take().is_ok());
+        assert!(lim.try_take().is_ok());
+        assert!(lim.try_take().is_err());
+        assert_eq!(lim.count_last_hour(), 2);
     }
 }
