@@ -41,6 +41,7 @@ pub fn build_registry_with_policy(policy: Arc<dyn SafetyPolicy>) -> Registry {
         RegisteredCommand::from_app::<commands::Models>(),
         RegisteredCommand::from_app::<commands::Login>(),
         RegisteredCommand::from_app::<commands::AuthImport>(),
+        RegisteredCommand::from_app::<commands::Inject>(),
         RegisteredCommand::from_app::<checkin::CheckinCmd>(),
         RegisteredCommand::from_app::<ask::Ask>(),
     ];
@@ -89,6 +90,7 @@ mod tests {
             "ask".to_string(),
             "auth".to_string(),
             "auth-import".to_string(),
+            "inject".to_string(),
             "checkin".to_string(),
             "login".to_string(),
             "models".to_string(),
@@ -108,7 +110,7 @@ mod tests {
             let c = reg.get(name).unwrap_or_else(|| panic!("缺少 `{name}`"));
             assert_eq!(c.schema.safety, SafetyTier::ReadOnly, "{name}");
         }
-        for name in ["login", "auth-import", "checkin", "ask", "serve"] {
+        for name in ["login", "auth-import", "inject", "checkin", "ask", "serve"] {
             if let Some(c) = reg.get(name) {
                 assert_eq!(c.schema.safety, SafetyTier::Confirm, "{name}");
             }

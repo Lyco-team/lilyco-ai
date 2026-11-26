@@ -29,6 +29,11 @@ pub struct Login {
         default = false
     )]
     no_browser: bool,
+    #[arg(
+        about = "CDP endpoint (e.g. http://127.0.0.1:9229). Empty auto-detects ego-lite/9229; when available the sign-in page is opened in that browser and the Lilyco control badge is injected",
+        default = ""
+    )]
+    cdp: String,
 }
 
 fn run_login(app: &Login, ctx: &Context) -> Result<Value, AppError> {
@@ -37,7 +42,7 @@ fn run_login(app: &Login, ctx: &Context) -> Result<Value, AppError> {
         LogLevel::Info,
         "正在打开华为云登录页；如果浏览器没有自动弹出，请手动打开下面打印的地址".to_string(),
     );
-    let outcome = login::run(app.timeout, !app.no_browser)?;
+    let outcome = login::run(app.timeout, !app.no_browser, app.cdp.trim())?;
     let out = json!({
         "ok": true,
         "login_url": outcome.login_url,
@@ -46,6 +51,8 @@ fn run_login(app: &Login, ctx: &Context) -> Result<Value, AppError> {
         "user_name": outcome.credential.user_name,
         "expires_at": outcome.credential.expires_at,
         "source": outcome.credential.source,
+        "cdp": outcome.cdp,
+        "injected": outcome.injected,
         "elapsed_ms": start.elapsed().as_millis() as u64,
     });
     ctx.log(
@@ -434,6 +441,164 @@ fn split_csv(line: &str) -> Vec<String> {
     out
 }
 
+/// 注入「Lilyco 智能助手控制中」悬浮徽章（T1）
+///
+/// 复用 lilyco-webchat-core 的 CDP 驱动：默认探测 ego-lite / 9229，注入现有页面
+/// （可用 --page-match 指定 URL 片段）；给 --url 则新开标签页后注入。
+/// 只改页面 DOM，不读取、不上传任何凭据，也不修改远端数据。
+#[derive(App)]
+#[app(
+    name = "inject",
+    run = "run_inject",
+    safety = "t1",
+    about = "Inject the 'Lilyco 智能助手控制中' overlay badge into a browser page over CDP. Empty --url injects into an existing page (use --page-match to pick by URL substring, otherwise the first page); a non-empty --url opens a new tab and injects there. The badge is re-injected for ~6 seconds so it survives navigation. It only changes the page DOM; it never reads or uploads cookies/credentials and never touches remote data. Safety T1: modifies the visible page."
+)]
+pub struct Inject {
+    #[arg(
+        about = "CDP endpoint (e.g. http://127.0.0.1:9229); empty auto-detects ego-lite/9229",
+        default = ""
+    )]
+    cdp: String,
+    #[arg(
+        about = "Open this URL in a new tab and inject; empty injects into an existing page",
+        default = ""
+    )]
+    url: String,
+    #[arg(
+        about = "Match an existing page URL substring (e.g. codearts). Empty picks the first page",
+        default = ""
+    )]
+    page_match: String,
+    #[arg(about = "Badge subtitle", default = "等待 CodeArts 任务")]
+    subtitle: String,
+}
+
+#[derive(Clone, Debug)]
+struct PageTarget {
+    url: String,
+    ws: String,
+}
+
+fn pick_cdp(hint: &str) -> Option<String> {
+    lilyco_webchat_core::cdp::candidate_endpoints(hint, "LCODEARTS_CDP")
+        .into_iter()
+        .find(|endpoint| lilyco_webchat_core::cdp::probe(endpoint).is_ok())
+}
+
+fn list_pages(endpoint: &str) -> Result<Vec<PageTarget>, AppError> {
+    let res = ureq::get(format!("{endpoint}/json/list"))
+        .call()
+        .map_err(|e| AppError::Runtime(format!("读取 CDP 页面列表失败: {e}")))?;
+    if !res.status().is_success() {
+        return Err(AppError::Runtime(format!(
+            "{endpoint}/json/list → HTTP {}",
+            res.status()
+        )));
+    }
+    let text = res
+        .into_body()
+        .read_to_string()
+        .map_err(|e| AppError::Runtime(format!("读页面列表失败: {e}")))?;
+    parse_pages(&text)
+}
+
+fn parse_pages(raw: &str) -> Result<Vec<PageTarget>, AppError> {
+    let v: Value = serde_json::from_str(raw)
+        .map_err(|e| AppError::Runtime(format!("页面列表不是 JSON: {e}")))?;
+    let arr = v
+        .as_array()
+        .ok_or_else(|| AppError::Runtime("页面列表不是数组".to_string()))?;
+    Ok(arr
+        .iter()
+        .filter_map(|p| {
+            if p.get("type").and_then(Value::as_str) != Some("page") {
+                return None;
+            }
+            let url = p.get("url").and_then(Value::as_str)?;
+            let ws = p.get("webSocketDebuggerUrl").and_then(Value::as_str)?;
+            Some(PageTarget {
+                url: url.to_string(),
+                ws: ws.to_string(),
+            })
+        })
+        .collect())
+}
+
+fn pick_page<'a>(pages: &'a [PageTarget], needle: &str) -> Option<&'a PageTarget> {
+    if needle.is_empty() {
+        pages.first()
+    } else {
+        pages
+            .iter()
+            .find(|p| p.url.contains(needle))
+            .or_else(|| pages.first())
+    }
+}
+
+fn run_inject(app: &Inject, ctx: &Context) -> Result<Value, AppError> {
+    use lilyco_webchat_core::cdp::Client;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let endpoint = pick_cdp(app.cdp.trim()).ok_or_else(|| {
+        AppError::InvalidInput(
+            "找不到可用的 CDP。先启动 ego-browser（默认 127.0.0.1:9229），或用 --cdp 指定"
+                .to_string(),
+        )
+    })?;
+
+    let (target_url, mut client) = if !app.url.trim().is_empty() {
+        // about:blank + Page.navigate：避免 /json/new?{url} 把 URL 里的 ? / & 截断
+        let (_id, ws) = lilyco_webchat_core::cdp::create_target_url(&endpoint, "about:blank")?;
+        let mut client = Client::connect(&ws)?;
+        client.navigate(app.url.trim())?;
+        (app.url.trim().to_string(), client)
+    } else {
+        let pages = list_pages(&endpoint)?;
+        let page = pick_page(&pages, app.page_match.trim())
+            .ok_or_else(|| AppError::Runtime("没有可注入的 page 标签页".to_string()))?;
+        let client = Client::connect(&page.ws)?;
+        (page.url.clone(), client)
+    };
+
+    client.bring_to_front();
+    // 页面加载/跳转会清掉 DOM，循环补注入，确保用户看到
+    for _ in 0..10 {
+        client.inject_control_badge(&app.subtitle);
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    let present = client
+        .eval_js("Boolean(document.getElementById('lilyco-control-badge'))")
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let actual_url = client
+        .eval_js("location.href")
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| target_url.clone());
+
+    let out = json!({
+        "ok": present,
+        "cdp": endpoint,
+        "target_url": actual_url,
+        "subtitle": app.subtitle,
+        "present": present,
+        "elapsed_ms": start.elapsed().as_millis() as u64,
+    });
+    ctx.log(
+        LogLevel::Info,
+        format!(
+            "已向 {} 注入「Lilyco 智能助手控制中 · {}」（present={}）",
+            out["target_url"].as_str().unwrap_or(""),
+            app.subtitle,
+            present
+        ),
+    );
+    ctx.done(out.clone(), start.elapsed().as_millis() as u64);
+    Ok(out)
+}
+
 fn credit_ratio(m: &Value) -> String {
     m.get("credit")
         .and_then(Value::as_array)
@@ -470,6 +635,30 @@ mod tests {
         let c = parse_import(v).unwrap();
         assert_eq!(c.access_key, "AKJ");
         assert_eq!(c.security_token.as_deref(), Some("STJ"));
+    }
+
+    #[test]
+    fn parse_pages_filters_and_matches() {
+        let raw = r#"[
+          {"type":"page","url":"https://codearts.huaweicloud.com/portal","webSocketDebuggerUrl":"ws://x/1"},
+          {"type":"service_worker","url":"chrome-extension://x/background.js","webSocketDebuggerUrl":"ws://x/2"},
+          {"type":"page","url":"https://chat.deepseek.com/","webSocketDebuggerUrl":"ws://x/3"}
+        ]"#;
+        let pages = parse_pages(raw).unwrap();
+        assert_eq!(pages.len(), 2, "service_worker 不应被当成页面");
+        assert_eq!(
+            pick_page(&pages, "codearts").unwrap().url,
+            "https://codearts.huaweicloud.com/portal"
+        );
+        assert_eq!(
+            pick_page(&pages, "").unwrap().url,
+            "https://codearts.huaweicloud.com/portal"
+        );
+        assert_eq!(
+            pick_page(&pages, "missing").unwrap().url,
+            "https://codearts.huaweicloud.com/portal",
+            "匹配不到时回退第一页"
+        );
     }
 
     #[test]

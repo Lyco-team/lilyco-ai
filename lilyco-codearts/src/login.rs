@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 
 use crate::cred::Credential;
 use crate::util;
+use lilyco_webchat_core::cdp::{self, Client};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 const AUTH_BASE: &str = "https://auth.huaweicloud.com/authui/login.html";
 const DOER_REDIRECT: &str = "https://devcloud.cn-north-4.huaweicloud.com/doer/redirect";
@@ -33,10 +36,18 @@ pub struct LoginOutcome {
     pub credential: Credential,
     pub login_url: String,
     pub saved_to: std::path::PathBuf,
+    /// 实际使用的 CDP 端点（None = 系统默认浏览器）
+    pub cdp: Option<String>,
+    /// 是否成功在登录页注入了「Lilyco 智能助手控制中」徽章
+    pub injected: bool,
 }
 
 /// 完整登录：起回调、开浏览器、等授权、换凭据、落盘。
-pub fn run(timeout_secs: u64, open_browser: bool) -> Result<LoginOutcome, AppError> {
+pub fn run(
+    timeout_secs: u64,
+    open_browser: bool,
+    cdp_hint: &str,
+) -> Result<LoginOutcome, AppError> {
     let ticket = util::uuid_v4();
     let listener = bind_listener().map_err(|e| {
         AppError::Runtime(format!(
@@ -48,18 +59,39 @@ pub fn run(timeout_secs: u64, open_browser: bool) -> Result<LoginOutcome, AppErr
         .map_err(|e| AppError::Runtime(format!("读回调端口失败: {e}")))?
         .port();
     let login_url = build_login_url(port, &ticket);
-    // 浏览器没能自动打开时（远程/无桌面），用户至少能从终端复制这个地址
+    // 远程/无桌面时用户至少要能从终端复制地址
     eprintln!("lcodearts login: 请打开 {login_url}");
 
+    let mut used_cdp: Option<String> = None;
+    let mut injection: Option<(Arc<AtomicU8>, std::thread::JoinHandle<()>)> = None;
     if open_browser {
-        let _ = std::process::Command::new("xdg-open")
-            .arg(&login_url)
-            .spawn();
+        match pick_cdp(cdp_hint) {
+            Some(endpoint) => match start_badge_thread(&endpoint, &login_url) {
+                Ok((state, handle)) => {
+                    used_cdp = Some(endpoint);
+                    injection = Some((state, handle));
+                }
+                Err(e) => {
+                    eprintln!("CDP 注入失败（{endpoint}），回退系统浏览器：{e}");
+                    open_in_browser(&login_url);
+                }
+            },
+            None => open_in_browser(&login_url),
+        }
     }
 
-    let secret = wait_for_secret(&listener, timeout_secs).map_err(|e| {
+    let secret = wait_for_secret(&listener, timeout_secs);
+    if let Some((state, handle)) = injection.take() {
+        state.store(
+            if secret.is_ok() { 1 } else { 2 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let _ = handle.join();
+    }
+    let secret = secret.map_err(|e| {
         AppError::Runtime(format!("等待华为云授权失败：{e}\n登录地址：{login_url}"))
     })?;
+
     let mut credential = poll_for_credential(&ticket, &secret, 120)?;
     credential.source = "huawei-oauth".to_string();
     let saved_to = crate::cred::save(&credential)?;
@@ -67,7 +99,50 @@ pub fn run(timeout_secs: u64, open_browser: bool) -> Result<LoginOutcome, AppErr
         credential,
         login_url,
         saved_to,
+        injected: used_cdp.is_some(),
+        cdp: used_cdp,
     })
+}
+
+/// 选一个可用的 CDP（显式 → `LCODEARTS_CDP` → ego-lite → 9229/9222/9223/9333）
+fn pick_cdp(hint: &str) -> Option<String> {
+    cdp::candidate_endpoints(hint, "LCODEARTS_CDP")
+        .into_iter()
+        .find(|endpoint| cdp::probe(endpoint).is_ok())
+}
+
+fn open_in_browser(url: &str) {
+    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+}
+
+/// 用 CDP 打开登录页并每 600ms 重注入徽章（页面跳转会清掉 DOM，必须反复补）。
+/// 用 about:blank + Page.navigate，绕开 `/json/new?{url}` 对 `?`/`&` 的截断问题。
+fn start_badge_thread(
+    endpoint: &str,
+    url: &str,
+) -> Result<(Arc<AtomicU8>, std::thread::JoinHandle<()>), AppError> {
+    let (_target_id, ws_url) = cdp::create_target_url(endpoint, "about:blank")?;
+    let mut client = Client::connect(&ws_url)?;
+    client.bring_to_front();
+    client.navigate(url)?;
+    let state = Arc::new(AtomicU8::new(0));
+    let flag = state.clone();
+    let handle = std::thread::spawn(move || {
+        while flag.load(Ordering::Relaxed) == 0 {
+            client.inject_control_badge("等待华为云授权…");
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+        match flag.load(Ordering::Relaxed) {
+            1 => {
+                client.inject_control_badge("✅ 授权成功，正在换取凭据");
+                std::thread::sleep(std::time::Duration::from_millis(900));
+            }
+            _ => {
+                client.inject_control_badge("⚠️ 授权未完成，请回终端重试");
+            }
+        }
+    });
+    Ok((state, handle))
 }
 
 fn bind_listener() -> std::io::Result<TcpListener> {

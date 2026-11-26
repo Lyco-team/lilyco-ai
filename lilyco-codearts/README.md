@@ -14,6 +14,7 @@
 | `lcodearts login` | 浏览器授权华为云，换临时 AK/SK/STS 并保存（0600） | T1 |
 | `lcodearts auth` | 当前凭据是谁、从哪来、什么时候过期（不打印 SK） | T0 |
 | `lcodearts auth-import` | 导入华为云长期 AK/SK（stdin / CSV / JSON，0600） | T1 |
+| `lcodearts inject` | 往 CDP 页面注入「Lilyco 智能助手控制中」悬浮徽章 | T1 |
 | `lcodearts quota` | 积分套餐：总额 / 已用 / 剩余 / 过期日 | T0 |
 | `lcodearts models` | 可用模型清单与积分倍率 | T0 |
 | `lcodearts checkin` | 领取今天的运营活动奖励（通常 +1000 积分） | T1 |
@@ -68,7 +69,15 @@ lcodearts ask --prompt "用一句话解释 borrow checker" --model glm-5.3
 
 # 5) OpenAI 兼容端 + 后台自动签到
 lcodearts serve            # 默认 127.0.0.1:8793
+
+# 6) 往浏览器注入 Lilyco 悬浮徽章（ego-browser 默认 9229）
+lcodearts inject --url https://codearts.huaweicloud.com/portal
+lcodearts inject --page-match codearts      # 注入已打开的页面
 ```
+
+`login` 也会自动探测 ego-browser / CDP 9229，在华为云登录页注入同样的
+「🤖 Lilyco 智能助手控制中 · 等待华为云授权…」徽章；授权成功后变成
+「✅ 授权成功，正在换取凭据」。没有 CDP 时回退系统浏览器。
 
 四端与其它 Lilyco 应用相同：
 
@@ -162,9 +171,9 @@ lcodearts checkin --repeat --after-hour 8 --interval 300
 - 浏览器登录与签到：`AIcivilization/dsh-model`（`codearts-login.js` / `codearts.js`）
 - 四端结构：本仓库的 `lilyco-chatgpt`
 
-本地单测 33 项：签名金标准四组向量、canonical URI/query、活动状态与多签到选择、
+本地单测 34 项：签名金标准四组向量、canonical URI/query、活动状态与多签到选择、
 领取响应分类、SSE 聚合（文本 / 思维链 / tool_calls）、凭据 0600、签到状态、
-长期 AK/SK 的两行 / CSV / JSON 导入解析。
+长期 AK/SK 的两行 / CSV / JSON 导入解析、CDP 页面列表过滤与匹配。
 
 真实上游验证（2026-11-26，账号 lilyco42）：
 
