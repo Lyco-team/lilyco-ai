@@ -259,6 +259,273 @@ impl Client {
             other => Ok(other),
         }
     }
+
+    /// 把当前标签页切到前台，让用户能直接看到悬浮提示卡并交互
+    pub fn bring_to_front(&mut self) {
+        let _ = self.call("Page.bringToFront", json!({}));
+    }
+
+    /// 导航到指定 URL（用于先注入 Cookies 再刷新进入目标站）
+    pub fn navigate(&mut self, url: &str) -> Result<(), AppError> {
+        self.call("Page.navigate", json!({ "url": url }))?;
+        Ok(())
+    }
+
+    /// 在受控页面右上角注入「🤖 Lilyco 智能助手控制中」悬浮徽章（幂等）
+    pub fn inject_control_badge(&mut self, subtitle: &str) {
+        let sub = serde_json::to_string(subtitle).unwrap_or_else(|_| "\"\"".to_string());
+        let js = format!(
+            r#"(() => {{
+  const id = 'lilyco-control-badge';
+  let el = document.getElementById(id);
+  if (!el) {{
+    el = document.createElement('div');
+    el.id = id;
+    el.style.cssText = [
+      'position:fixed', 'top:14px', 'right:16px', 'z-index:2147483647',
+      'display:flex', 'align-items:center', 'gap:8px',
+      'padding:8px 14px', 'border-radius:999px',
+      'background:rgba(15,23,42,0.90)', 'color:#f8fafc',
+      'font:600 13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+      'box-shadow:0 8px 24px rgba(0,0,0,0.28)',
+      'border:1px solid rgba(56,189,248,0.55)',
+      'backdrop-filter:blur(10px)', 'pointer-events:none'
+    ].join(';');
+    document.documentElement.appendChild(el);
+  }}
+  const sub = {sub};
+  el.textContent = sub ? ('🤖 Lilyco 智能助手控制中 · ' + sub) : '🤖 Lilyco 智能助手控制中';
+}})()"#
+        );
+        let _ = self.eval_js(&js);
+    }
+
+    /// 注入带交互按钮的「人工交接悬浮窗」：提示任务内容、保存路径与「导出 Cookies 并保存」按钮。
+    /// 页面跳转/登录后如果悬浮窗消失，轮询时可反复调用以自动补回。
+    pub fn inject_handoff_card(&mut self, task: &str, save_path: &str) {
+        let task_js = serde_json::to_string(task).unwrap_or_else(|_| "\"\"".to_string());
+        let path_js = serde_json::to_string(save_path).unwrap_or_else(|_| "\"\"".to_string());
+        let js = format!(
+            r#"(() => {{
+  const id = 'lilyco-handoff-card';
+  if (document.getElementById(id)) return;
+  const card = document.createElement('div');
+  card.id = id;
+  card.style.cssText = [
+    'position:fixed', 'top:18px', 'right:18px', 'z-index:2147483647',
+    'width:340px', 'max-width:calc(100vw - 36px)',
+    'padding:16px 18px', 'border-radius:14px',
+    'background:rgba(15,23,42,0.95)', 'color:#f8fafc',
+    'font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+    'box-shadow:0 16px 40px rgba(0,0,0,0.42)',
+    'border:1px solid rgba(56,189,248,0.65)',
+    'backdrop-filter:blur(12px)'
+  ].join(';');
+  const title = document.createElement('div');
+  title.style.cssText = 'font-weight:700;font-size:14px;color:#38bdf8;margin-bottom:8px;display:flex;align-items:center;gap:6px;';
+  title.textContent = '🤖 Lilyco 智能助手控制中';
+  const body = document.createElement('div');
+  body.style.cssText = 'font-size:13px;color:#e2e8f0;margin-bottom:8px;';
+  body.textContent = 'AI 给你发布了任务：' + {task_js};
+  const hint = document.createElement('div');
+  hint.style.cssText = 'font-size:12px;color:#94a3b8;margin-bottom:12px;word-break:break-all;';
+  hint.textContent = '完成后点击下方按钮导出 Cookies，保存到：' + {path_js};
+  const btn = document.createElement('button');
+  btn.id = 'lilyco-handoff-export-btn';
+  btn.type = 'button';
+  btn.style.cssText = [
+    'width:100%', 'padding:10px 14px', 'border:none', 'border-radius:9px',
+    'background:linear-gradient(135deg,#0ea5e9,#2563eb)', 'color:#ffffff',
+    'font-weight:600', 'font-size:13px', 'cursor:pointer'
+  ].join(';');
+  btn.textContent = '导出 Cookies 并保存';
+  btn.onclick = () => {{
+    window.__lilycoExportRequested = true;
+    btn.disabled = true;
+    btn.textContent = '正在导出 Cookies...';
+    btn.style.opacity = '0.75';
+  }};
+  card.appendChild(title);
+  card.appendChild(body);
+  card.appendChild(hint);
+  card.appendChild(btn);
+  document.documentElement.appendChild(card);
+}})()"#
+        );
+        let _ = self.eval_js(&js);
+    }
+
+    /// 更新人工交接悬浮窗为完成态
+    pub fn mark_handoff_done(&mut self, summary: &str) {
+        let msg = serde_json::to_string(summary).unwrap_or_else(|_| "\"\"".to_string());
+        let js = format!(
+            r#"(() => {{
+  const btn = document.getElementById('lilyco-handoff-export-btn');
+  if (btn) {{
+    btn.disabled = true;
+    btn.style.background = '#16a34a';
+    btn.style.opacity = '1';
+    btn.textContent = {msg};
+  }}
+}})()"#
+        );
+        let _ = self.eval_js(&js);
+    }
+
+    /// 通过 CDP 导出匹配域名的全部 Cookies + 当前页 `localStorage`（用于无头服务器复用登录态）
+    pub fn export_cookies_and_storage(&mut self, domain_filter: &str) -> Result<Value, AppError> {
+        let raw_cookies = self
+            .call("Storage.getCookies", json!({}))
+            .or_else(|_| self.call("Network.getAllCookies", json!({})))?;
+        let filter = domain_filter.trim().to_ascii_lowercase();
+        let cookies: Vec<Value> = raw_cookies
+            .get("cookies")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| {
+                if filter.is_empty() {
+                    return true;
+                }
+                c.get("domain")
+                    .and_then(Value::as_str)
+                    .map(|d| d.to_ascii_lowercase().contains(&filter))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let ls = self
+            .eval_json(
+                r#"(() => {
+  const out = {};
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k !== null) out[k] = localStorage.getItem(k);
+    }
+  } catch (_) {}
+  return JSON.stringify(out);
+})()"#,
+            )
+            .unwrap_or_else(|_| json!({}));
+        let origin = self
+            .eval_js("location.origin")
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let exported_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Ok(json!({
+            "domain": domain_filter,
+            "origin": origin,
+            "exported_at": exported_at,
+            "cookie_count": cookies.len(),
+            "cookies": cookies,
+            "local_storage": ls,
+        }))
+    }
+
+    /// 把导出的 Cookies + localStorage 注入到当前（无头或本机）浏览器实例
+    pub fn import_cookies_and_storage(
+        &mut self,
+        session_file: &std::path::Path,
+    ) -> Result<usize, AppError> {
+        let raw = std::fs::read_to_string(session_file).map_err(|e| {
+            AppError::Runtime(format!("读登录态文件 {} 失败: {e}", session_file.display()))
+        })?;
+        let v: Value = serde_json::from_str(&raw).map_err(|e| {
+            AppError::Runtime(format!("解析登录态 JSON 失败: {e}"))
+        })?;
+        let cookies = v
+            .get("cookies")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if !cookies.is_empty() {
+            let _ = self.call("Network.enable", json!({}));
+            self.call("Network.setCookies", json!({ "cookies": cookies }))?;
+        }
+        if let Some(ls) = v.get("local_storage").and_then(Value::as_object) {
+            if !ls.is_empty() {
+                let encoded = serde_json::to_string(ls).unwrap_or_else(|_| "{}".to_string());
+                let js = format!(
+                    r#"(() => {{
+  try {{
+    const data = {encoded};
+    for (const [k, v] of Object.entries(data)) {{
+      if (typeof v === 'string') localStorage.setItem(k, v);
+    }}
+  }} catch (_) {{}}
+}})()"#
+                );
+                let _ = self.eval_js(&js);
+            }
+        }
+        Ok(cookies.len())
+    }
+}
+
+/// 人工交接登录：打开目标网页、切到前台、弹出「Lilyco 智能助手控制中」悬浮窗，
+/// 等用户登录并点击「导出 Cookies 并保存」后自动落盘（权限 0600），供无头服务器直接导入复用。
+pub fn handoff_login(
+    cdp: &str,
+    url: &str,
+    domain_filter: &str,
+    task_desc: &str,
+    out_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<Value, AppError> {
+    probe(cdp)?;
+    let (target_id, ws_url) = create_target_url(cdp, url)?;
+    let mut client = Client::connect(&ws_url)?;
+    client.bring_to_front();
+    let path_str = out_path.display().to_string();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        client.inject_handoff_card(task_desc, &path_str);
+        let clicked = client
+            .eval_js("Boolean(window.__lilycoExportRequested)")
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if clicked {
+            let bundle = client.export_cookies_and_storage(domain_filter)?;
+            if let Some(parent) = out_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    AppError::Runtime(format!("创建目录 {} 失败: {e}", parent.display()))
+                })?;
+            }
+            let text = serde_json::to_string_pretty(&bundle)
+                .map_err(|e| AppError::Runtime(format!("序列化登录态失败: {e}")))?;
+            std::fs::write(out_path, &text).map_err(|e| {
+                AppError::Runtime(format!("写入 {} 失败: {e}", out_path.display()))
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(out_path, std::fs::Permissions::from_mode(0o600));
+            }
+            let count = bundle["cookie_count"].as_u64().unwrap_or(0);
+            client.mark_handoff_done(&format!("✅ 已导出 {count} 条 Cookies 并保存"));
+            std::thread::sleep(Duration::from_millis(1200));
+            close_target(cdp, &target_id);
+            return Ok(json!({
+                "ok": true,
+                "domain": domain_filter,
+                "cookie_count": count,
+                "saved_to": path_str,
+                "cdp": cdp,
+            }));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    close_target(cdp, &target_id);
+    Err(AppError::Runtime(format!(
+        "等待 {} 秒未点击「导出 Cookies 并保存」",
+        timeout.as_secs()
+    )))
 }
 
 /// 折叠空白并剥离零宽字符（ProseMirror / 富文本输入框读回校验用）

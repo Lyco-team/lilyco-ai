@@ -40,11 +40,17 @@ pub struct Serve {
     api_key: String,
     #[arg(about = "Max queued requests (0 means 16)", default = 0)]
     max_queue: u16,
+    #[arg(
+        about = "Optional exported cookies/localStorage JSON file for headless server mode",
+        default = ""
+    )]
+    session_file: std::path::PathBuf,
 }
 
 struct Config {
     cdp: String,
     api_key: Option<String>,
+    session_file: Option<std::path::PathBuf>,
     queue: SerialQueue,
     sessions: SessionStore,
 }
@@ -98,6 +104,7 @@ fn run_serve(app: &Serve, ctx: &Context) -> Result<Value, AppError> {
     let cfg = Arc::new(Config {
         cdp: app.cdp.trim().to_string(),
         api_key,
+        session_file: crate::resolve_session_file(&app.session_file),
         queue: SerialQueue::new(if app.max_queue == 0 {
             16
         } else {
@@ -223,6 +230,7 @@ async fn chat_completions(
                 deep_think,
                 bound_cid.as_deref(),
                 &cfg2.cdp,
+                cfg2.session_file.as_deref(),
                 &ctx,
                 &mut |_| {},
             )?;
@@ -275,6 +283,7 @@ async fn chat_completions(
                 deep_think,
                 bound_cid.as_deref(),
                 &cfg2.cdp,
+                cfg2.session_file.as_deref(),
                 &ctx,
                 &mut |full| {
                     if let Some(d) = diff.next(full) {

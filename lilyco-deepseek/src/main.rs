@@ -5,6 +5,7 @@
 //! - `SerialQueue`（并发=1 串行队列）+ `verify_bearer`（可选 API Key 鉴权）
 //! - `SessionStore`（锚点会话绑定 + 增量续聊）+ `estimate_tokens` + `cap_transcript` + `Diff`
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,9 +17,88 @@ use serde_json::{json, Value};
 mod serve;
 
 const SITE_URL: &str = "https://chat.deepseek.com/";
+const DOMAIN_FILTER: &str = "deepseek.com";
 const ENV_CDP: &str = "LDEEPSEEK_CDP";
 const COMPOSER_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(240);
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 默认登录态保存路径：`~/.local/share/ldeepseek/session.json`
+pub fn default_session_path() -> PathBuf {
+    let base = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".local/share"))
+        })
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    base.join("ldeepseek").join("session.json")
+}
+
+/// 人工交接登录并导出 Cookies + localStorage，供无头服务器直接复用（T1）
+#[derive(App)]
+#[app(
+    name = "login",
+    run = "run_login",
+    safety = "t1",
+    about = "Open chat.deepseek.com with a floating Lilyco handoff overlay ('Lilyco 智能助手控制中'), let the user sign in and click '导出 Cookies 并保存', and write cookies + localStorage (0600) to --out for headless server reuse. Safety T1."
+)]
+pub struct Login {
+    #[arg(
+        about = "Output JSON path for exported cookies + localStorage (empty means ~/.local/share/ldeepseek/session.json)",
+        default = ""
+    )]
+    out: PathBuf,
+    #[arg(about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229", default = "")]
+    cdp: String,
+}
+
+fn run_login(app: &Login, ctx: &Context) -> Result<Value, AppError> {
+    let start = Instant::now();
+    let out_path = if app.out.as_os_str().is_empty() {
+        default_session_path()
+    } else {
+        app.out.clone()
+    };
+    let mut tried = Vec::new();
+    for ep in cdp::candidate_endpoints(&app.cdp, ENV_CDP) {
+        if let Err(e) = cdp::probe(&ep) {
+            tried.push(format!("  - {ep}: {e}"));
+            continue;
+        }
+        ctx.log(
+            LogLevel::Info,
+            format!(
+                "已在浏览器打开 chat.deepseek.com 并弹出悬浮提示窗，请登录后点击「导出 Cookies 并保存」→ {}",
+                out_path.display()
+            ),
+        );
+        let res = cdp::handoff_login(
+            &ep,
+            SITE_URL,
+            DOMAIN_FILTER,
+            "登录 chat.deepseek.com",
+            &out_path,
+            LOGIN_TIMEOUT,
+        )?;
+        ctx.log(
+            LogLevel::Info,
+            format!(
+                "已导出 {} 条 Cookies 到 {}",
+                res["cookie_count"], res["saved_to"]
+            ),
+        );
+        ctx.done(res.clone(), start.elapsed().as_millis() as u64);
+        return Ok(res);
+    }
+    Err(AppError::InvalidInput(format!(
+        "连不上可用的 Chromium CDP（请先启动 ego-browser）\n试过的端点：\n{}",
+        tried.join("\n")
+    )))
+}
 
 /// 检查本机 CDP 浏览器是否就绪（只读 T0）
 #[derive(App)]
@@ -84,6 +164,11 @@ pub struct Ask {
     conversation_id: String,
     #[arg(about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229", default = "")]
     cdp: String,
+    #[arg(
+        about = "Optional exported cookies/localStorage JSON file (for headless server mode; auto-loads ~/.local/share/ldeepseek/session.json if present)",
+        default = ""
+    )]
+    session_file: PathBuf,
 }
 
 fn run_ask(app: &Ask, ctx: &Context) -> Result<Value, AppError> {
@@ -93,7 +178,16 @@ fn run_ask(app: &Ask, ctx: &Context) -> Result<Value, AppError> {
         return Err(AppError::InvalidArg("prompt 不能为空".to_string()));
     }
     let cid = (!app.conversation_id.trim().is_empty()).then_some(app.conversation_id.trim());
-    let out = ask_web(prompt, app.deep_think, cid, &app.cdp, ctx, &mut |_| {})?;
+    let sess = resolve_session_file(&app.session_file);
+    let out = ask_web(
+        prompt,
+        app.deep_think,
+        cid,
+        &app.cdp,
+        sess.as_deref(),
+        ctx,
+        &mut |_| {},
+    )?;
     if let Some(txt) = out["text"].as_str() {
         ctx.log(LogLevel::Info, txt.to_string());
     }
@@ -101,12 +195,21 @@ fn run_ask(app: &Ask, ctx: &Context) -> Result<Value, AppError> {
     Ok(out)
 }
 
-/// 驱动 `chat.deepseek.com` 页面完成一次问答，支持流式增量回调
+pub fn resolve_session_file(explicit: &std::path::Path) -> Option<PathBuf> {
+    if !explicit.as_os_str().is_empty() {
+        return Some(explicit.to_path_buf());
+    }
+    let def = default_session_path();
+    def.exists().then_some(def)
+}
+
+/// 驱动 `chat.deepseek.com` 页面完成一次问答，支持无头 Cookies 注入与流式增量回调
 pub fn ask_web(
     prompt: &str,
     deep_think: bool,
     conversation_id: Option<&str>,
     explicit_cdp: &str,
+    session_file: Option<&std::path::Path>,
     ctx: &Context,
     on_text: &mut dyn FnMut(&str),
 ) -> Result<Value, AppError> {
@@ -122,7 +225,7 @@ pub fn ask_web(
             None => SITE_URL.to_string(),
         };
         let (target_id, ws_url) = cdp::create_target_url(&ep, &url)?;
-        let res = run_deepseek_tab(&ws_url, prompt, deep_think, ctx, on_text);
+        let res = run_deepseek_tab(&ws_url, &url, prompt, deep_think, session_file, ctx, on_text);
         if res.is_ok() {
             cdp::close_target(&ep, &target_id);
         }
@@ -186,15 +289,29 @@ const SNAPSHOT_JS: &str = r#"(() => {
 
 fn run_deepseek_tab(
     ws_url: &str,
+    target_url: &str,
     prompt: &str,
     deep_think: bool,
+    session_file: Option<&std::path::Path>,
     ctx: &Context,
     on_text: &mut dyn FnMut(&str),
 ) -> Result<(Option<String>, String), AppError> {
     let mut client = Client::connect(ws_url)?;
+    if let Some(sf) = session_file {
+        if sf.exists() {
+            let n = client.import_cookies_and_storage(sf)?;
+            ctx.log(
+                LogLevel::Info,
+                format!("已向浏览器注入 {} 条登录态 Cookies，刷新进入目标页", n),
+            );
+            client.navigate(target_url)?;
+            std::thread::sleep(Duration::from_millis(1200));
+        }
+    }
     let deadline = Instant::now() + COMPOSER_TIMEOUT;
     let mut ready = false;
     while Instant::now() < deadline {
+        client.inject_control_badge("正在等待页面就绪");
         let p = client.eval_json(READY_JS).unwrap_or(Value::Null);
         if p.get("ready").and_then(Value::as_bool).unwrap_or(false) {
             ready = true;
@@ -204,9 +321,10 @@ fn run_deepseek_tab(
     }
     if !ready {
         return Err(AppError::Runtime(
-            "等了 30 秒 chat.deepseek.com 输入框还没出来（请确认已登录）".to_string(),
+            "等了 30 秒 chat.deepseek.com 输入框还没出来（请先运行 `ldeepseek login` 登录并导出 Cookies）".to_string(),
         ));
     }
+    client.inject_control_badge("正在与 DeepSeek 对话");
 
     if deep_think {
         // 如果页面上有「深度思考 / DeepThink」开关且未激活，点一下开启
@@ -283,6 +401,7 @@ pub fn build_registry(policy: Arc<dyn SafetyPolicy>) -> Registry {
     #[allow(unused_mut)]
     let mut cmds = vec![
         RegisteredCommand::from_app::<Check>(),
+        RegisteredCommand::from_app::<Login>(),
         RegisteredCommand::from_app::<Ask>(),
     ];
     #[cfg(feature = "server")]
