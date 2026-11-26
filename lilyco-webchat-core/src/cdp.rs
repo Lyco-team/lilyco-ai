@@ -14,7 +14,7 @@ use crate::util::clip;
 
 const FALLBACK_PORTS: &[u16] = &[9229, 9222, 9223, 9333];
 const CDP_HTTP_TIMEOUT: Duration = Duration::from_secs(6);
-const CDP_WS_TIMEOUT: Duration = Duration::from_secs(25);
+const CDP_WS_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn agent() -> ureq::Agent {
     let cfg = ureq::Agent::config_builder()
@@ -435,9 +435,8 @@ impl Client {
         let raw = std::fs::read_to_string(session_file).map_err(|e| {
             AppError::Runtime(format!("读登录态文件 {} 失败: {e}", session_file.display()))
         })?;
-        let v: Value = serde_json::from_str(&raw).map_err(|e| {
-            AppError::Runtime(format!("解析登录态 JSON 失败: {e}"))
-        })?;
+        let v: Value = serde_json::from_str(&raw)
+            .map_err(|e| AppError::Runtime(format!("解析登录态 JSON 失败: {e}")))?;
         let cookies = v
             .get("cookies")
             .and_then(Value::as_array)
@@ -499,9 +498,8 @@ pub fn handoff_login(
             }
             let text = serde_json::to_string_pretty(&bundle)
                 .map_err(|e| AppError::Runtime(format!("序列化登录态失败: {e}")))?;
-            std::fs::write(out_path, &text).map_err(|e| {
-                AppError::Runtime(format!("写入 {} 失败: {e}", out_path.display()))
-            })?;
+            std::fs::write(out_path, &text)
+                .map_err(|e| AppError::Runtime(format!("写入 {} 失败: {e}", out_path.display())))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
