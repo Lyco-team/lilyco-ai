@@ -274,10 +274,31 @@ fn set_input_js(prompt: &str) -> String {
     )
 }
 
+/// 找到 DeepSeek 输入框旁边的圆形主发送按钮（`[role="button"].ds-button--primary.ds-button--filled`）
+const SEND_BTN_JS: &str = r#"(() => {
+  const ta = document.querySelector('textarea, div[contenteditable="true"]');
+  const root = ta ? (ta.closest('form') || ta.parentElement?.parentElement?.parentElement || document) : document;
+  const primary = root.querySelector('[role="button"].ds-button--primary.ds-button--filled, button.ds-button--primary.ds-button--filled');
+  const candidates = primary ? [primary] : Array.from(root.querySelectorAll('button, [role="button"]')).filter(b => {
+    const r = b.getBoundingClientRect();
+    return r.width >= 24 && r.height >= 24 && b.querySelector('svg');
+  });
+  const btn = candidates[candidates.length - 1];
+  if (!btn) return JSON.stringify({ ok: false, why: 'send-button-missing' });
+  const disabled = btn.disabled || btn.getAttribute('aria-disabled') === 'true' || (btn.className || '').toString().includes('disabled');
+  const r = btn.getBoundingClientRect();
+  return JSON.stringify({
+    ok: !disabled && r.width > 0 && r.height > 0,
+    disabled,
+    x: r.x + r.width / 2,
+    y: r.y + r.height / 2,
+  });
+})()"#;
+
 const SNAPSHOT_JS: &str = r#"(() => {
   const nodes = Array.from(document.querySelectorAll('.ds-markdown, [class*="markdown"]'));
   const last = nodes.length ? (nodes[nodes.length - 1].innerText || '').trim() : '';
-  const generating = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="停止"], [class*="stop"]');
+  const generating = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="停止"], [role="button"][aria-label*="Stop"], [role="button"][aria-label*="停止"]');
   const m = location.pathname.match(/\/a\/chat\/s\/([^/?#]+)/);
   return JSON.stringify({
     count: nodes.length,
@@ -345,13 +366,40 @@ fn run_deepseek_tab(
     let before = client.eval_json(SNAPSHOT_JS).unwrap_or(Value::Null);
     let before_count = before.get("count").and_then(Value::as_u64).unwrap_or(0);
 
-    let set = client.eval_json(&set_input_js(prompt))?;
-    if !set.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        return Err(AppError::Runtime("找不到 DeepSeek 输入框".to_string()));
+    // 短提示走 CDP Input.insertText 触发最真实的 React 输入事件；长提示走 setter 避免卡顿
+    if prompt.len() <= 2000 {
+        let _ = client.eval_js(
+            "document.querySelector('textarea, div[contenteditable=\"true\"]')?.focus()",
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        client.insert_text(prompt)?;
+    } else {
+        let set = client.eval_json(&set_input_js(prompt))?;
+        if !set.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return Err(AppError::Runtime("找不到 DeepSeek 输入框".to_string()));
+        }
     }
-    std::thread::sleep(Duration::from_millis(350));
-    ctx.log(LogLevel::Info, "已写入 DeepSeek 输入框，发送消息".to_string());
-    client.press_key("Enter", "Enter", 13)?;
+    std::thread::sleep(Duration::from_millis(400));
+
+    // 点真正的发送按钮（DeepSeek 网页上合成 Enter 不会触发发送）
+    let mut sent = false;
+    for _ in 0..10 {
+        let sb = client.eval_json(SEND_BTN_JS).unwrap_or(Value::Null);
+        if sb.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            let x = sb["x"].as_f64().unwrap_or(0.0);
+            let y = sb["y"].as_f64().unwrap_or(0.0);
+            ctx.log(LogLevel::Info, "已写入 DeepSeek 输入框，点击发送按钮".to_string());
+            client.click_point(x, y)?;
+            sent = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if !sent {
+        return Err(AppError::Runtime(
+            "DeepSeek 发送按钮未变为可点状态，未能发送".to_string(),
+        ));
+    }
 
     let reply_deadline = Instant::now() + REPLY_TIMEOUT;
     let mut best = String::new();
