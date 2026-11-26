@@ -2,6 +2,7 @@
 members = [
     "lilyco-aic",
     "lilyco-bitnet",
+    "lilyco-chatgpt",
     "lilyco-mpkg",
     "lilyco-web2cli",
 ]

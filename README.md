@@ -8,6 +8,7 @@ Lilyco AI & agent domain suite: aic, chatgpt, bitnet, mpkg memory packages & web
 
 - `lilyco-aic`
 - `lilyco-bitnet`
+- `lilyco-chatgpt`
 - `lilyco-mpkg`
 - `lilyco-web2cli`
 
