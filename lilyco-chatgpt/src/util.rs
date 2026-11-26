@@ -90,46 +90,14 @@ pub fn base64url_decode(s: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// 标准 base64（带 `=` 填充）。只用于把图片内联进 JSON / MCP 内容块。
+/// 标准 base64（带 `=` 填充）。委托给 `lilyco-webchat-core`。
 pub fn base64_encode(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        let n = ((chunk[0] as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
-        out.push(T[(n >> 18) as usize & 63] as char);
-        out.push(T[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            T[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
+    lilyco_webchat_core::util::base64_encode(data)
 }
 
-/// 按魔数判断图片类型：返回 `(mime, 扩展名)`。
-///
-/// MCP 客户端只认 png / jpeg / webp / gif 四种 MIME，所以这里也只用这四个；
-/// 认不出来就当二进制，宁可不上图也不给客户端一个它渲染不了的 mime。
+/// 按魔数判断图片类型：返回 `(mime, 扩展名)`。委托给 `lilyco-webchat-core`。
 pub fn sniff_image_mime(bytes: &[u8]) -> (&'static str, &'static str) {
-    if bytes.starts_with(b"\x89PNG") {
-        ("image/png", "png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        ("image/jpeg", "jpg")
-    } else if bytes.starts_with(b"RIFF") && bytes.len() > 11 && &bytes[8..12] == b"WEBP" {
-        ("image/webp", "webp")
-    } else if bytes.starts_with(b"GIF8") {
-        ("image/gif", "gif")
-    } else {
-        ("application/octet-stream", "bin")
-    }
+    lilyco_webchat_core::util::sniff_image_mime(bytes)
 }
 #[cfg(test)]
 mod tests {

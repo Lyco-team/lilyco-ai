@@ -16,6 +16,7 @@ path = "src/main.rs"
 # 应用 crate 只依赖 facade：core 的类型走 lilyco::prelude::*，
 # derive(App) 默认展开成 ::lilyco::__core::…（要绕开 facade 用 #[app(crate = "lilyco_core")]）
 lilyco = { version = "0.3", git = "https://github.com/lilyco-42/lilyco.git", optional = true, default-features = false }
+lilyco-webchat-core = { path = "../lilyco-webchat-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # 与 lilyco-web2cli 同一个 HTTP 栈：ureq 3 + rustls + ring，纯 Rust，

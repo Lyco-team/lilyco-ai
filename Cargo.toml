@@ -3,8 +3,10 @@ members = [
     "lilyco-aic",
     "lilyco-bitnet",
     "lilyco-chatgpt",
+    "lilyco-deepseek",
     "lilyco-mpkg",
     "lilyco-web2cli",
+    "lilyco-webchat-core",
 ]
 resolver = "2"
 
