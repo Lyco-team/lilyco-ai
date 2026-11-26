@@ -52,7 +52,10 @@ pub struct Login {
         default = ""
     )]
     out: PathBuf,
-    #[arg(about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229", default = "")]
+    #[arg(
+        about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229",
+        default = ""
+    )]
     cdp: String,
 }
 
@@ -108,7 +111,10 @@ fn run_login(app: &Login, ctx: &Context) -> Result<Value, AppError> {
     about = "Check whether a local Chromium CDP endpoint (ego-lite 9229 by default) is reachable for chat.deepseek.com. Read-only (safety T0)."
 )]
 pub struct Check {
-    #[arg(about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229", default = "")]
+    #[arg(
+        about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229",
+        default = ""
+    )]
     cdp: String,
 }
 
@@ -158,11 +164,20 @@ fn run_check(app: &Check, ctx: &Context) -> Result<Value, AppError> {
 pub struct Ask {
     #[arg(about = "Prompt text to send")]
     prompt: String,
-    #[arg(about = "Enable DeepThink (R1) toggle on the DeepSeek web composer", default = false)]
+    #[arg(
+        about = "Enable DeepThink (R1) toggle on the DeepSeek web composer",
+        default = false
+    )]
     deep_think: bool,
-    #[arg(about = "Existing chat.deepseek.com conversation id to continue", default = "")]
+    #[arg(
+        about = "Existing chat.deepseek.com conversation id to continue",
+        default = ""
+    )]
     conversation_id: String,
-    #[arg(about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229", default = "")]
+    #[arg(
+        about = "Explicit CDP endpoint, e.g. http://127.0.0.1:9229",
+        default = ""
+    )]
     cdp: String,
     #[arg(
         about = "Optional exported cookies/localStorage JSON file (for headless server mode; auto-loads ~/.local/share/ldeepseek/session.json if present)",
@@ -225,7 +240,15 @@ pub fn ask_web(
             None => SITE_URL.to_string(),
         };
         let (target_id, ws_url) = cdp::create_target_url(&ep, &url)?;
-        let res = run_deepseek_tab(&ws_url, &url, prompt, deep_think, session_file, ctx, on_text);
+        let res = run_deepseek_tab(
+            &ws_url,
+            &url,
+            prompt,
+            deep_think,
+            session_file,
+            ctx,
+            on_text,
+        );
         if res.is_ok() {
             cdp::close_target(&ep, &target_id);
         }
@@ -296,15 +319,36 @@ const SEND_BTN_JS: &str = r#"(() => {
 })()"#;
 
 const SNAPSHOT_JS: &str = r#"(() => {
-  const nodes = Array.from(document.querySelectorAll('.ds-markdown, [class*="markdown"]'));
-  const last = nodes.length ? (nodes[nodes.length - 1].innerText || '').trim() : '';
-  const generating = !!document.querySelector('button[aria-label*="Stop"], button[aria-label*="停止"], [role="button"][aria-label*="Stop"], [role="button"][aria-label*="停止"]');
+  const norm = s => (s || '').trim();
+  const msgs = Array.from(document.querySelectorAll('.ds-message'));
+  const lastMsg = msgs.length ? msgs[msgs.length - 1] : null;
+  const bodyNode = lastMsg
+    ? lastMsg.querySelector('.ds-assistant-message-main-content')
+    : null;
+  const fallback = Array.from(document.querySelectorAll('.ds-markdown'))
+    .filter(e => !e.classList.contains('ds-think-content'));
+  const text = norm(
+    (bodyNode || fallback[fallback.length - 1] || {}).innerText || ''
+  );
+  const thinkNode = lastMsg
+    ? lastMsg.querySelector('.ds-think-content')
+    : document.querySelector('.ds-think-content');
+  const think = norm((thinkNode || {}).innerText || '');
+  const generating = !!document.querySelector(
+    'button[aria-label*="Stop"], button[aria-label*="停止"], [role="button"][aria-label*="Stop"], [role="button"][aria-label*="停止"]'
+  ) || (lastMsg ? !!lastMsg.querySelector('.ds-loading, [class*="loading"]') : false);
   const m = location.pathname.match(/\/a\/chat\/s\/([^/?#]+)/);
+  const body = document.body ? document.body.innerText : '';
+  const errLines = body.split('\n')
+    .filter(l => /quota reached|usage limit|rate limit|额度已用完|额度不足|达到上限|请求过于频繁|服务器繁忙|请升级/i.test(l))
+    .slice(0, 3);
   return JSON.stringify({
-    count: nodes.length,
-    text: last,
+    count: msgs.length || fallback.length,
+    text,
+    think,
     generating,
     conversation_id: m ? m[1] : null,
+    error: errLines.join(' | '),
   });
 })()"#;
 
@@ -317,6 +361,7 @@ fn run_deepseek_tab(
     ctx: &Context,
     on_text: &mut dyn FnMut(&str),
 ) -> Result<(Option<String>, String), AppError> {
+    let started = Instant::now();
     let mut client = Client::connect(ws_url)?;
     if let Some(sf) = session_file {
         if sf.exists() {
@@ -368,9 +413,8 @@ fn run_deepseek_tab(
 
     // 短提示走 CDP Input.insertText 触发最真实的 React 输入事件；长提示走 setter 避免卡顿
     if prompt.len() <= 2000 {
-        let _ = client.eval_js(
-            "document.querySelector('textarea, div[contenteditable=\"true\"]')?.focus()",
-        );
+        let _ = client
+            .eval_js("document.querySelector('textarea, div[contenteditable=\"true\"]')?.focus()");
         std::thread::sleep(Duration::from_millis(120));
         client.insert_text(prompt)?;
     } else {
@@ -388,7 +432,10 @@ fn run_deepseek_tab(
         if sb.get("ok").and_then(Value::as_bool).unwrap_or(false) {
             let x = sb["x"].as_f64().unwrap_or(0.0);
             let y = sb["y"].as_f64().unwrap_or(0.0);
-            ctx.log(LogLevel::Info, "已写入 DeepSeek 输入框，点击发送按钮".to_string());
+            ctx.log(
+                LogLevel::Info,
+                "已写入 DeepSeek 输入框，点击发送按钮".to_string(),
+            );
             client.click_point(x, y)?;
             sent = true;
             break;
@@ -401,19 +448,37 @@ fn run_deepseek_tab(
         ));
     }
 
+    ctx.log(
+        LogLevel::Info,
+        if deep_think {
+            "已发送，DeepSeek 正在深度思考（可能需要几十秒）…".to_string()
+        } else {
+            "已发送，等待 DeepSeek 回答…".to_string()
+        },
+    );
     let reply_deadline = Instant::now() + REPLY_TIMEOUT;
     let mut best = String::new();
     let mut conv_id: Option<String> = None;
     let mut stable_ticks = 0u8;
+    let mut last_progress_tick = Instant::now();
     std::thread::sleep(Duration::from_millis(2000));
 
     while Instant::now() < reply_deadline {
         if let Ok(snap) = client.eval_json(SNAPSHOT_JS) {
+            if let Some(err) = snap.get("error").and_then(Value::as_str) {
+                if !err.trim().is_empty() {
+                    return Err(AppError::Runtime(format!(
+                        "DeepSeek 返回错误：{}（额度/限流/登录问题，稍后重试或换账号）",
+                        err.trim()
+                    )));
+                }
+            }
             if let Some(cid) = snap.get("conversation_id").and_then(Value::as_str) {
                 conv_id = Some(cid.to_string());
             }
             let count = snap.get("count").and_then(Value::as_u64).unwrap_or(0);
             let txt = snap.get("text").and_then(Value::as_str).unwrap_or("");
+            let think = snap.get("think").and_then(Value::as_str).unwrap_or("");
             let generating = snap
                 .get("generating")
                 .and_then(Value::as_bool)
@@ -425,10 +490,41 @@ fn run_deepseek_tab(
                     on_text(&best);
                 } else if !generating {
                     stable_ticks += 1;
-                    if stable_ticks >= 2 {
+                    if stable_ticks >= 3 {
+                        // 生成结束瞬间 DeepSeek 可能刚从分段节点重排成完整节点，返回前再抓一次
+                        if let Ok(final_snap) = client.eval_json(SNAPSHOT_JS) {
+                            if let Some(final_txt) = final_snap.get("text").and_then(Value::as_str)
+                            {
+                                if final_txt.chars().count() >= best.chars().count() {
+                                    best = final_txt.to_string();
+                                }
+                            }
+                        }
+                        ctx.log(
+                            LogLevel::Info,
+                            format!("DeepSeek 回答完成（{} 字）", best.chars().count()),
+                        );
                         return Ok((conv_id, best));
                     }
                 }
+            }
+            // 每 5 秒给一次进度：deep-think 的长思考期间终端不能一片空白，
+            // 否则用户会以为命令卡死（这是「一直不回复」的主要体感来源）。
+            if last_progress_tick.elapsed() >= Duration::from_secs(5) {
+                let phase = if txt.is_empty() && !think.is_empty() {
+                    "深度思考中"
+                } else {
+                    "生成中"
+                };
+                ctx.log(
+                    LogLevel::Info,
+                    format!(
+                        "DeepSeek {phase}…（已 {} 秒，已收 {} 字）",
+                        started.elapsed().as_secs(),
+                        best.chars().count()
+                    ),
+                );
+                last_progress_tick = Instant::now();
             }
         }
         std::thread::sleep(Duration::from_millis(1200));
