@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 # default-features = false → headless（CLI + MCP），与 lilyco-plc 等工具族一致
-lilyco = { git = "https://github.com/lilyco-42/lilyco.git", default-features = false }
+lilyco = { version = "0.3.1", default-features = false }
 serde_json = "1"
 # 本地 BitNet b1.58 推理引擎（进程内 lib 复用，非子进程）
 # bitnet-rs 已锁 rev（feat/model-api 已 squash 合并进 main）
