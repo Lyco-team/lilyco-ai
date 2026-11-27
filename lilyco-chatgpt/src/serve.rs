@@ -134,6 +134,8 @@ struct BoundSession {
     sent_turns: usize,
     /// 上一轮结束时活动分支的节点数，续聊直接复用，避免发前再 GET 一次触发 429
     branch_len: usize,
+    /// 最近一次命中或写入的时间；超限时据此淘汰最旧的一条，而不是把整张表清空
+    last_used: std::time::Instant,
 }
 
 /// 滑动 1 小时窗口限流器（保护 120 张/24h 的生图配额不被刷爆）
@@ -687,15 +689,19 @@ fn split_chat_messages(messages: &[Value]) -> (Vec<String>, Vec<(&'static str, S
     (sys, turns)
 }
 
-/// 生成会话锚点：取 system 前 200 字符（不含尾部动态时间戳）+ 第一条 User 消息。
-/// 这样 dsh 每轮刷新 time-context 时，依然能稳定命中同一条 ChatGPT 网页会话。
-fn session_anchor(sys: &[String], turns: &[(&'static str, String)]) -> Option<u64> {
-    let first_user = turns.iter().find(|(r, _)| *r == "User").map(|(_, t)| t)?;
+/// 生成会话锚点：只用第一条真正的 User 消息，不掺入 system prompt。
+///
+/// 早先的实现把 system 前 200 字符也算进锚点，但 dsh 的 goal 模式会在
+/// system 头部注入每轮都会变化的动态状态（goal 进度、时间、工作区），
+/// 头部一变锚点就变，于是每一轮都新建一条 ChatGPT 网页会话，账号里堆满对话。
+/// system 里没有真正稳定的会话标识，所以锚点只认第一条非 system-reminder 的
+/// User 消息；reminder 是 dsh 每轮都会重写的动态上下文，必须跳过。
+fn session_anchor(turns: &[(&'static str, String)]) -> Option<u64> {
+    let first_user = turns
+        .iter()
+        .find(|(r, t)| *r == "User" && !t.trim_start().starts_with("<system-reminder>"))
+        .map(|(_, t)| t)?;
     let mut h = DefaultHasher::new();
-    if let Some(s) = sys.first() {
-        let head: String = s.chars().take(200).collect();
-        head.hash(&mut h);
-    }
     first_user.hash(&mut h);
     Some(h.finish())
 }
@@ -1077,7 +1083,15 @@ fn run_job(cfg: &Config, job: &Job, sink: &mut dyn FnMut(&str)) -> Result<Reply,
                         .unwrap_or(0) as usize;
                     if let Ok(mut map) = cfg.sessions.lock() {
                         if map.len() >= MAX_BOUND_SESSIONS && !map.contains_key(key) {
-                            map.clear();
+                            // 淘汰最久未用的一条，而不是全清：全清会让所有会话在下一轮
+                            // 都失去绑定、各自新建一条网页对话，正是对话堆积的放大器。
+                            if let Some(evict) = map
+                                .iter()
+                                .min_by_key(|(_, b)| b.last_used)
+                                .map(|(k, _)| *k)
+                            {
+                                map.remove(&evict);
+                            }
                         }
                         map.insert(
                             *key,
@@ -1086,6 +1100,7 @@ fn run_job(cfg: &Config, job: &Job, sink: &mut dyn FnMut(&str)) -> Result<Reply,
                                 // +1 代表本轮即将回给客户端的 assistant 回复
                                 sent_turns: total_turns + 1,
                                 branch_len,
+                                last_used: std::time::Instant::now(),
                             },
                         );
                     }
@@ -1366,7 +1381,7 @@ async fn chat_completions(
                     "invalid_request_error",
                 );
             }
-            let (sys, turns) = split_chat_messages(&messages);
+            let (_sys, turns) = split_chat_messages(&messages);
             let last_user = turns
                 .iter()
                 .rev()
@@ -1387,7 +1402,7 @@ async fn chat_completions(
                     effort,
                 }
             } else {
-                let anchor = session_anchor(&sys, &turns);
+                let anchor = session_anchor(&turns);
                 let (bound_conversation_id, bound_branch_len, delta_prompt) = anchor
                     .and_then(|key| cfg.sessions.lock().ok()?.get(&key).cloned())
                     .filter(|b| turns.len() > b.sent_turns)
@@ -1720,24 +1735,44 @@ mod tests {
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
     }
 
-    /// system 尾部动态时间戳变化时，会话锚点必须稳定不变
+    /// system prompt 头部/尾部注入动态状态时，会话锚点必须稳定不变
     #[test]
-    fn session_anchor_ignores_dynamic_tail_in_system_prompt() {
+    fn session_anchor_ignores_dynamic_system_prompt() {
         let sys_prefix = "You are an AI agent. ".repeat(15); // > 200 chars
         let t1_msgs = vec![
-            json!({"role": "system", "content": format!("{sys_prefix}\nTime: 18:10")}),
+            json!({"role": "system", "content": format!("Goal: step 1 of 9\n{sys_prefix}\nTime: 18:10")}),
             json!({"role": "user", "content": "帮我分析架构"}),
         ];
         let t2_msgs = vec![
-            json!({"role": "system", "content": format!("{sys_prefix}\nTime: 18:15")}),
+            json!({"role": "system", "content": format!("Goal: step 7 of 9\n{sys_prefix}\nTime: 18:15")}),
             json!({"role": "user", "content": "帮我分析架构"}),
             json!({"role": "assistant", "content": "好的"}),
             json!({"role": "user", "content": "继续"}),
         ];
-        let (s1, u1) = split_chat_messages(&t1_msgs);
-        let (s2, u2) = split_chat_messages(&t2_msgs);
-        assert_eq!(session_anchor(&s1, &u1), session_anchor(&s2, &u2));
+        let (_s1, u1) = split_chat_messages(&t1_msgs);
+        let (_s2, u2) = split_chat_messages(&t2_msgs);
+        assert_eq!(session_anchor(&u1), session_anchor(&u2));
         assert_eq!(format_delta_turns(&u2[2..]), "继续");
+    }
+
+    /// dsh 每轮重写的 system-reminder 不能被当成会话首条 User
+    #[test]
+    fn session_anchor_skips_system_reminder_messages() {
+        let t1_msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "<system-reminder>cwd: /a</system-reminder>"}),
+            json!({"role": "user", "content": "真正的问题"}),
+        ];
+        let t2_msgs = vec![
+            json!({"role": "system", "content": "stable"}),
+            json!({"role": "user", "content": "<system-reminder>cwd: /b</system-reminder>"}),
+            json!({"role": "user", "content": "真正的问题"}),
+            json!({"role": "assistant", "content": "好的"}),
+            json!({"role": "user", "content": "继续"}),
+        ];
+        let (_s1, u1) = split_chat_messages(&t1_msgs);
+        let (_s2, u2) = split_chat_messages(&t2_msgs);
+        assert_eq!(session_anchor(&u1), session_anchor(&u2));
     }
 
     #[test]
