@@ -83,6 +83,7 @@ mod auth;
 mod authinfo;
 mod browser;
 mod chat;
+mod import_cookies;
 mod jwt;
 mod list;
 mod login;
@@ -113,6 +114,7 @@ pub fn build_registry_with_policy(policy: Arc<dyn SafetyPolicy>) -> Registry {
         RegisteredCommand::from_app::<authinfo::Auth>(),
         RegisteredCommand::from_app::<ask::Ask>(),
         RegisteredCommand::from_app::<login::Login>(),
+        RegisteredCommand::from_app::<import_cookies::ImportCookies>(),
     ];
     // `serve` 只在编了 server feature 时存在：它是把同一批能力吐成 OpenAI 兼容
     // HTTP 端的那一层，给 dsh 之类的外部客户端当模型提供端用。
@@ -246,6 +248,7 @@ mod tests {
         let mut want: Vec<String> = vec![
             "ask".to_string(),
             "auth".to_string(),
+            "import-cookies".to_string(),
             "list".to_string(),
             "login".to_string(),
             "models".to_string(),
@@ -285,6 +288,11 @@ mod tests {
             SafetyTier::Confirm,
             "`login` 会写本地凭证并读浏览器登录态，必须是 T1"
         );
+        assert_eq!(
+            tier("import-cookies"),
+            SafetyTier::Confirm,
+            "`import-cookies` 会改写浏览器登录态，必须是 T1"
+        );
         #[cfg(feature = "server")]
         assert_eq!(
             tier("serve"),
@@ -313,6 +321,10 @@ mod tests {
         assert!(
             matches!(verdict("login"), GateDecision::Deny(_)),
             "MCP 面必须拦住 login"
+        );
+        assert!(
+            matches!(verdict("import-cookies"), GateDecision::Deny(_)),
+            "MCP 面必须拦住 import-cookies —— 它会换掉浏览器登录态"
         );
         #[cfg(feature = "server")]
         assert!(
