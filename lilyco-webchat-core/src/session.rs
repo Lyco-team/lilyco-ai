@@ -103,7 +103,22 @@ pub fn content_text(v: Option<&Value>) -> String {
 }
 
 pub fn message_text(m: &Value) -> String {
-    content_text(m.get("content"))
+    let mut text = content_text(m.get("content"));
+    if text.trim().is_empty() {
+        if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+            let parts = calls
+                .iter()
+                .map(|c| {
+                    let f = c.get("function");
+                    let name = f.and_then(|x| x.get("name")).and_then(Value::as_str).unwrap_or("tool");
+                    let args = f.and_then(|x| x.get("arguments")).and_then(Value::as_str).unwrap_or("{}");
+                    format!("{name}({args})")
+                })
+                .collect::<Vec<_>>();
+            if !parts.is_empty() { text = format!("[tool_calls] {}", parts.join(", ")); }
+        }
+    }
+    text
 }
 
 /// 拆分 `system/developer` 与非 system 轮次

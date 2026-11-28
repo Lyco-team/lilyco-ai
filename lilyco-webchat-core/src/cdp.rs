@@ -93,8 +93,11 @@ pub fn probe(cdp: &str) -> Result<(), AppError> {
 
 /// 新开一个指定 URL 的标签页，返回 `(target_id, ws_url)`
 pub fn create_target_url(cdp: &str, url: &str) -> Result<(String, String), AppError> {
+    // `/json/new?<url>` 把参数整个当 URL；`#` 必须编码成 %23，否则会被当片段
+    // 截断，新建页变成 about:blank（lchatgpt 踩过这个坑）。
+    let encoded = url.replace('#', "%23");
     let created = agent()
-        .put(format!("{cdp}/json/new?{url}"))
+        .put(format!("{cdp}/json/new?{encoded}"))
         .send_empty()
         .map_err(|e| AppError::Runtime(format!("开新标签页失败: {e}")))?;
     let status = created.status();
@@ -589,6 +592,96 @@ pub fn handoff_login(
         "等待 {} 秒未点击「导出 Cookies 并保存」",
         timeout.as_secs()
     )))
+}
+
+/// 专用常驻页：跨请求复用同一张标签页，绝不碰用户自己开的页面。
+/// 这是 ego-browser `task space` 的轻量版——共享 Chromium profile（登录态继承），
+/// 隔离的是「哪些标签归工具控制」：靠持久化的 target id + URL hash 标记认领。
+/// 常驻页没有「新建后 React 监听未挂稳」的加载竞态，也便于观察页面状态。
+fn dedicated_id_path(tool: &str) -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))?;
+    Some(base.join(tool).join("dedicated-target.json"))
+}
+
+fn read_dedicated_id(tool: &str) -> Option<String> {
+    let path = dedicated_id_path(tool)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("id").and_then(Value::as_str).map(str::to_string)
+}
+
+fn write_dedicated_id(tool: &str, id: &str, cdp: &str) {
+    let Some(path) = dedicated_id_path(tool) else { return };
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() { return; }
+    let body = json!({ "id": id, "cdp": cdp }).to_string();
+    if std::fs::write(&path, body).is_err() { return; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// 找由 `tool` 控制的专用常驻标签页；没有就新建并记住它的 target id。
+/// `tool` 决定持久化目录名与 hash 标记（如 `ldeepseek` → `#ldeepseek-dedicated`）。
+/// 只认两类标签：持久化的 target id（导航不变，最稳）或 URL 带 hash 标记（兼容旧版）。
+/// 绝不碰用户自己开的页面。返回的 page 各请求复用、永不关闭。
+pub fn dedicated_target(cdp: &str, tool: &str, site_url: &str) -> Result<(String, String), AppError> {
+    let mark = format!("#{tool}-dedicated");
+    let list = agent()
+        .get(format!("{cdp}/json/list"))
+        .call()
+        .map_err(|e| AppError::Runtime(format!("读 {cdp}/json/list 失败: {e}")))?;
+    let raw = list
+        .into_body()
+        .read_to_string()
+        .map_err(|e| AppError::Runtime(format!("读标签页列表失败: {e}")))?;
+    let targets: Value = serde_json::from_str(&raw)
+        .map_err(|e| AppError::Runtime(format!("CDP 列表不是 JSON: {e}")))?;
+
+    let saved_id = read_dedicated_id(tool);
+    let mut found: Option<(String, String)> = None;
+    if let Some(items) = targets.as_array() {
+        // 第一轮：持久化的 target id（SPA 导航会抹掉 hash，target id 稳定）
+        if let Some(ref sid) = saved_id {
+            for t in items {
+                let kind = t.get("type").and_then(Value::as_str).unwrap_or("");
+                let ws = t.get("webSocketDebuggerUrl").and_then(Value::as_str).unwrap_or("");
+                if kind == "page" && t.get("id").and_then(Value::as_str) == Some(sid.as_str()) && !ws.is_empty() {
+                    found = Some((sid.clone(), ws.to_string()));
+                    break;
+                }
+            }
+        }
+        // 第二轮：URL hash 标记（兼容旧版 / 持久化文件丢失）
+        if found.is_none() {
+            for t in items {
+                let url = t.get("url").and_then(Value::as_str).unwrap_or("");
+                let kind = t.get("type").and_then(Value::as_str).unwrap_or("");
+                let ws = t.get("webSocketDebuggerUrl").and_then(Value::as_str).unwrap_or("");
+                if kind == "page" && url.contains(&mark) && !ws.is_empty() {
+                    found = Some((
+                        t.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                        ws.to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    let (id, ws) = match found {
+        Some(pair) => pair,
+        None => {
+            let pair = create_target_url(cdp, &format!("{site_url}{mark}"))?;
+            write_dedicated_id(tool, &pair.0, cdp);
+            pair
+        }
+    };
+    Ok((id, ws))
 }
 
 /// 折叠空白并剥离零宽字符（ProseMirror / 富文本输入框读回校验用）
