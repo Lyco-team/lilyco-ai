@@ -32,8 +32,12 @@ use std::time::{Duration, Instant};
 
 /// 输入框就绪的最长等待（新标签页要加载整个 SPA）
 const COMPOSER_TIMEOUT: Duration = Duration::from_secs(45);
-/// 点发送后等「这次提问出现在会话列表里」的最长等待（实测约 16 秒，留足余量）
-const CONVERSATION_TIMEOUT: Duration = Duration::from_secs(90);
+/// 续接会话时等会话数据加载完的最长等待（实测约 15 秒，留足余量）
+const CONVERSATION_READY_TIMEOUT: Duration = Duration::from_secs(45);
+/// 点发送后等「这次提问出现在会话列表里」的最长等待。
+/// 实测正常约 16 秒；但风控/服务端落库抖动时会拖到 90 秒以上，
+/// 而且页面已落到 /c/local-chatgpt: 就证明消息确实发出去了，不该急着重试/误报失败。
+const CONVERSATION_TIMEOUT: Duration = Duration::from_secs(180);
 /// 找新会话时两次列表查询之间歇多久
 const LIST_INTERVAL: Duration = Duration::from_millis(2000);
 /// 发消息前抓一次会话列表快照，最多试几次（这台机器上偶发 unexpected end of file）
@@ -71,6 +75,21 @@ const STATE_JS: &str = r#"(() => {
     button: !!btn,
     enabled: btn ? !btn.disabled : false,
   });
+})()"#;
+
+/// 续接会话页是否加载完：发送按钮已渲染、且「正在加载对话」提示消失。
+/// 实测新标签页里 composer 先于会话数据出现，此时发送按钮是 disabled，
+/// 过早写入并点击会一直失败，最终误判成「续接失败」而新建会话（对话堆积的根因）。
+const CONVERSATION_READY_JS: &str = r#"(() => {
+  const btn = document.querySelector('button[aria-label="发送"], button[aria-label="Send"], button[data-testid="send-button"]');
+  const composer = document.querySelector('div[contenteditable="true"]');
+  const loading = /正在加载 ChatGPT 对话|Loading conversation/i.test(document.body.innerText || '');
+  const enabled = btn ? !btn.disabled : false;
+  // 关键：必须等 composer 与发送按钮都渲染、且会话数据不在加载中。
+  // 实测专用页导航到续接会话后，composer 先出现但发送按钮要晚几秒才有，
+  // 只等 composer 会让 compose 撞上重渲染窗口、insertText 被冲掉（14 次全空）。
+  // 不能要求 enabled —— 空输入框时发送按钮本来就是 disabled。
+  return JSON.stringify({ ready: !!composer && !!btn && !loading, button: !!btn, enabled, composer: !!composer, loading });
 })()"#;
 
 /// 点发送。注意 `Input.dispatchKeyEvent` 造 Enter **发不出去**（实测 40 秒无任何反应），
@@ -213,10 +232,18 @@ fn apply_model_and_effort(
     }
 
     let open_menu = |client: &mut Client| -> Result<Value, AppError> {
-        // 刚进页面时 React 事件监听可能还没挂稳，最多试 3 次点开菜单
-        for attempt in 0..3 {
+        // 刚进页面时 React 事件监听可能还没挂稳，反复点开菜单。
+        // 每轮都重新读按钮坐标：React 重渲染会让它移位；点完延长等待，
+        // 并先确认菜单是否已经打开（上一轮可能异步生效）。
+        for attempt in 0..8 {
+            if let Some(open) = eval_json(client, MODEL_MENU_JS)
+                .ok()
+                .filter(|m| m.get("open").and_then(Value::as_bool).unwrap_or(false))
+            {
+                return Ok(open);
+            }
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(600));
+                std::thread::sleep(Duration::from_millis(500));
             }
             let btn = eval_json(client, MODEL_BTN_JS)?;
             if !btn.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -228,7 +255,7 @@ fn apply_model_and_effort(
                 continue;
             }
             client.click_point(x, y)?;
-            for _ in 0..6 {
+            for _ in 0..12 {
                 std::thread::sleep(Duration::from_millis(200));
                 let m = eval_json(client, MODEL_MENU_JS)?;
                 if m.get("open").and_then(Value::as_bool).unwrap_or(false) {
@@ -377,7 +404,13 @@ fn wait_for_composer(client: &mut Client) -> Result<(), AppError> {
     let mut last = String::from("标签页还没开始加载");
     while Instant::now() < deadline {
         let probe = eval_json(client, READY_JS).unwrap_or(Value::Null);
-        if probe.get("ready").and_then(Value::as_bool).unwrap_or(false) {
+        let ready = probe.get("ready").and_then(Value::as_bool).unwrap_or(false);
+        let state = probe.get("state").and_then(Value::as_str).unwrap_or("");
+        let loaded = state == "complete" || state == "interactive";
+        // composer 渲染出来即可放行：interactive 阶段 React 监听通常已挂稳，
+        // 强等 complete 反而会在 reload 后偶发卡住（实测 readyState 停在 interactive 45s）。
+        // 菜单点击的兜底由 open_menu 的多轮重试负责，compose 有自己的重试。
+        if ready && loaded {
             return Ok(());
         }
         last = format!(
@@ -390,6 +423,24 @@ fn wait_for_composer(client: &mut Client) -> Result<(), AppError> {
     Err(AppError::Runtime(format!(
         "等了 {} 秒网页输入框还没出来（{last}）—— 这个浏览器可能没登录 chatgpt.com",
         COMPOSER_TIMEOUT.as_secs()
+    )))
+}
+
+/// 续接会话专用：等会话数据真正加载完（发送按钮已渲染且「正在加载对话」消失）。
+/// 不这么做的话，composer 先于数据出现，过早写入会让发送按钮一直 disabled，
+/// 14 次 compose 重试全打在加载阶段，最后误判失败并新建一条会话。
+fn wait_for_conversation_ready(client: &mut Client) -> Result<(), AppError> {
+    let deadline = Instant::now() + CONVERSATION_READY_TIMEOUT;
+    while Instant::now() < deadline {
+        let probe = eval_json(client, CONVERSATION_READY_JS).unwrap_or(Value::Null);
+        if probe.get("ready").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(750));
+    }
+    Err(AppError::Runtime(format!(
+        "等了 {} 秒会话还没加载完（发送按钮未就绪或仍在加载）",
+        CONVERSATION_READY_TIMEOUT.as_secs()
     )))
 }
 
@@ -496,7 +547,13 @@ fn compose(client: &mut Client, prompt: &str) -> Result<(), AppError> {
                 continue;
             }
         } else {
-            // 短提示走 CDP 的 Input.insertText：最贴近真实输入事件
+            // 短提示走 CDP 的 Input.insertText：最贴近真实输入事件。
+            // insertText 写进「当前聚焦的可编辑元素」，续接页在 clear 之后可能重渲染
+            // 把焦点冲掉，导致文字写不进输入框（实测 14 次全空）。这里显式再聚焦一次。
+            let _ = eval_json(
+                client,
+                "(() => { const el = document.querySelector('div[contenteditable=\"true\"]'); if (el && document.activeElement !== el) el.focus(); return 'ok'; })()",
+            );
             client.insert_text(prompt)?;
         }
         // 插完立刻读，React 往往还没把发送按钮从 disabled 里放出来，白读一次
@@ -886,22 +943,16 @@ fn ask_at(
 ) -> Result<Value, Attempt> {
     let started = Instant::now();
     browser::probe(cdp).map_err(|error| Attempt { error, sent: false })?;
-    // 自己开一个标签页，不碰用户正在看的那些
-    let (target_id, ws_url) = match opts.conversation_id {
-        Some(id) => browser::create_target_url(cdp, &format!("https://chatgpt.com/c/{id}")),
-        None => browser::create_target(cdp),
-    }
-    .map_err(|error| Attempt { error, sent: false })?;
+    // 复用 lchatgpt 专用常驻标签页（带 hash 标记），不碰用户自己开的 ChatGPT 页。
+    // 专用页跨请求常驻、不关闭：页面已加载完，就不会再有「新建后 React 监听未挂稳」
+    // 导致的模型菜单点不开 / 续接时误判「发送失败→新建会话」那串加载竞态。
+    let (_target_id, ws_url) =
+        browser::dedicated_target(cdp, opts.conversation_id).map_err(|error| Attempt {
+            error,
+            sent: false,
+        })?;
     let outcome = run_in_tab(&ws_url, opts, prompt, ctx, on);
-    // 只有在「明确完成」或「消息根本没发出去」时才关临时标签页；
-    // 如果消息已发出但超时/未完，保留标签页，避免把仍在进行的生图任务硬掐断。
-    let should_close = match &outcome {
-        Ok(done) => done.complete,
-        Err((sent, _)) => !sent,
-    };
-    if should_close {
-        browser::close_target(cdp, &target_id);
-    }
+    // 专用页是常驻的，任何情况下都不关闭：关掉它下次又要重新加载，等于退回竞态。
     match outcome {
         Ok(done) => {
             ctx.log(
@@ -988,6 +1039,9 @@ fn run_in_tab(
             LogLevel::Info,
             format!("续接会话 {cid}（已有 {before_len} 节点），把增量消息写进输入框"),
         );
+        // 续接页的 composer 先于会话数据渲染，过早写入会让发送按钮一直 disabled。
+        // 先等会话数据加载完，再写增量消息，避免误判失败后新建会话。
+        wait_for_conversation_ready(&mut client).map_err(|e| (true, e))?;
         compose(&mut client, prompt).map_err(|e| (true, e))?;
         ctx.log(LogLevel::Info, "点发送".to_string());
         click_send(&mut client).map_err(|e| (true, e))?;

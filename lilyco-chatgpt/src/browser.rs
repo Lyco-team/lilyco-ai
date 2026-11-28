@@ -23,6 +23,9 @@ use tungstenite::{Message, WebSocket};
 const SESSION_PATH: &str = "/api/auth/session";
 /// 起新标签页时访问的地址
 const TARGET_URL: &str = "https://chatgpt.com/";
+/// 专用常驻标签页的标记：停在 URL 的 hash 里。chatgpt.com 的 SPA 会忽略 hash，
+/// 但它让我们能在 CDP 标签列表里认出「这块归 lchatgpt 专用」，绝不碰用户自己开的页。
+const DEDICATED_MARK: &str = "#lchatgpt-dedicated";
 /// 没指定、也没有 ego-lite 配置时依次试的端口
 const FALLBACK_PORTS: &[u16] = &[9229, 9222, 9223, 9333];
 
@@ -214,8 +217,11 @@ pub(crate) fn create_target(cdp: &str) -> Result<(String, String), AppError> {
 ///
 /// 注意 Chrome 只认 `PUT`，`GET /json/new` 会回 405 —— 这点坑过一次。
 pub(crate) fn create_target_url(cdp: &str, url: &str) -> Result<(String, String), AppError> {
+    // `/json/new?<url>` 把参数整个当 URL；`#` 必须编码成 %23，否则会被当片段
+    // 截断，新建页变成 about:blank（踩过一次）。
+    let encoded = url.replace('#', "%23");
     let created = agent()
-        .put(format!("{cdp}/json/new?{url}"))
+        .put(format!("{cdp}/json/new?{encoded}"))
         .send_empty()
         .map_err(|e| AppError::Runtime(format!("开新标签页失败: {e}")))?;
     let status = created.status();
@@ -241,6 +247,153 @@ pub(crate) fn create_target_url(cdp: &str, url: &str) -> Result<(String, String)
         .and_then(Value::as_str)
         .ok_or_else(|| AppError::Runtime("新标签页没有 webSocketDebuggerUrl".to_string()))?
         .to_string();
+    Ok((id, ws))
+}
+
+/// 专用页 CDP target id 的持久化文件。只存一个标签 id（不是凭证），0600。
+/// 之所以不靠 URL hash 做长期标记：ChatGPT SPA 进入会话后会把 hash 抹掉。
+fn dedicated_id_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("lchatgpt").join("dedicated-target.json"))
+}
+
+fn read_dedicated_id() -> Option<String> {
+    let path = dedicated_id_path()?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("id").and_then(Value::as_str).map(str::to_string)
+}
+
+fn write_dedicated_id(id: &str, cdp: &str) {
+    let Some(path) = dedicated_id_path() else { return };
+    let Some(dir) = path.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let body = json!({ "id": id, "cdp": cdp }).to_string();
+    if std::fs::write(&path, body).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// 找 lchatgpt 专用常驻标签页；没有就新建并记住它的 target id。必要时导航到目标会话。
+/// 专用页跨请求复用、永不关闭 —— 页面常驻就没有「新建后 React 监听还没挂稳」的加载竞态。
+/// 查找优先级：持久化的 target id（稳定，导航不变）→ URL hash 标记（兼容旧版）→ 新建。
+pub(crate) fn dedicated_target(
+    cdp: &str,
+    conversation_id: Option<&str>,
+) -> Result<(String, String), AppError> {
+    let list = agent()
+        .get(format!("{cdp}/json/list"))
+        .call()
+        .map_err(|e| AppError::Runtime(format!("读 {cdp}/json/list 失败: {e}")))?;
+    let raw = list
+        .into_body()
+        .read_to_string()
+        .map_err(|e| AppError::Runtime(format!("读标签页列表失败: {e}")))?;
+    let targets: Value = serde_json::from_str(&raw)
+        .map_err(|e| AppError::Runtime(format!("CDP 列表不是 JSON: {e}")))?;
+
+    let saved_id = read_dedicated_id();
+    let mut found: Option<(String, String)> = None;
+    if let Some(items) = targets.as_array() {
+        // 第一轮：优先认持久化 id（SPA 导航会抹掉 hash，但 target id 稳定）
+        if let Some(ref sid) = saved_id {
+            for t in items {
+                let kind = t.get("type").and_then(Value::as_str).unwrap_or("");
+                let ws = t
+                    .get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if kind == "page"
+                    && t.get("id").and_then(Value::as_str) == Some(sid.as_str())
+                    && !ws.is_empty()
+                {
+                    found = Some((
+                        sid.clone(),
+                        ws.to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+        // 第二轮：兼容旧版——URL 里还带 hash 标记的页
+        if found.is_none() {
+            for t in items {
+                let url = t.get("url").and_then(Value::as_str).unwrap_or("");
+                let kind = t.get("type").and_then(Value::as_str).unwrap_or("");
+                let ws = t
+                    .get("webSocketDebuggerUrl")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if kind == "page" && url.contains(DEDICATED_MARK) && !ws.is_empty() {
+                    found = Some((
+                        t.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                        ws.to_string(),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    let (id, ws) = match found {
+        Some(pair) => pair,
+        None => {
+            let pair = create_target_url(cdp, &format!("https://chatgpt.com/{DEDICATED_MARK}"))?;
+            write_dedicated_id(&pair.0, cdp);
+            pair
+        }
+    };
+
+    // 导航目标不带 hash：SPA 进入会话后会抹掉 hash，带上它会导致
+    // current != want 永远成立、每次都重新导航重载，反而制造竞态。
+    let want = match conversation_id {
+        Some(cid) => format!("https://chatgpt.com/c/{cid}"),
+        None => "https://chatgpt.com/".to_string(),
+    };
+    let mut client = Client::connect(&ws)?;
+    let current = client
+        .eval_js("location.href")
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default();
+    // 续接会话时即使 URL 已经是目标会话，也强制重新导航：
+    // 同一个标签页连续走多个会话后，SPA 内部路由会残留上一轮的 React 状态
+    // （实测卡在「停止生成」按钮、发送按钮永不出现），reload 才能清干净。
+    // 首页场景（conversation_id=None）保持不导航，避免打断正在输入的草稿。
+    let already = match conversation_id {
+        Some(_) => current.contains(&format!("/c/{}", conversation_id.unwrap())) && !current.starts_with("about:"),
+        None => current == "https://chatgpt.com/" || current.ends_with("/#lchatgpt-dedicated"),
+    };
+    if conversation_id.is_some() && already {
+        // URL 已是目标会话，但要强制 reload 清掉 SPA 残留的 React 状态
+        // （否则卡在「停止生成」、发送按钮永不出现）。Page.navigate 到相同 URL
+        // 在 Chrome 里可能是 no-op，reload 才可靠。
+        client.reload()?;
+    } else if !already {
+        client.call("Page.navigate", json!({ "url": want }))?;
+        // 等 URL 真正落地，避免把 about:blank 交给 run_in_tab
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            let now = client
+                .eval_js("location.href")
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            if now == want || now.contains("chatgpt.com") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
     Ok((id, ws))
 }
 
@@ -463,6 +616,19 @@ impl Client {
             return Err(AppError::Runtime(format!("页面求值出错: {msg}")));
         }
         Ok(res.pointer("/result/value").cloned().unwrap_or(Value::Null))
+    }
+
+    /// 把一组 cookie 注入当前页面所属的浏览器上下文。
+    /// 同名同域的会被覆盖；`__Secure-` 前缀必须 secure=true 才会被接受。
+    pub(crate) fn set_cookies(&mut self, cookies: &[Value]) -> Result<(), AppError> {
+        self.call("Network.setCookies", json!({ "cookies": cookies }))?;
+        Ok(())
+    }
+
+    /// 让当前页面重新加载（注入 cookie 后生效）。
+    pub(crate) fn reload(&mut self) -> Result<(), AppError> {
+        self.call("Page.reload", json!({ "ignoreCache": true }))?;
+        Ok(())
     }
 }
 
