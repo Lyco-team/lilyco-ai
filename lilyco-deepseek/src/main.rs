@@ -244,7 +244,10 @@ pub fn ask_web(
             Some(id) => format!("https://chat.deepseek.com/a/chat/s/{id}"),
             None => SITE_URL.to_string(),
         };
-        let (target_id, ws_url) = cdp::create_target_url(&ep, &url)?;
+        // 用 ldeepseek 专用常驻标签页（对标 ego-browser space / lchatgpt 专用页）：
+        // 跨请求复用、永不关闭——页面常驻就没有「新建后 React 监听未挂稳」的竞态，
+        // 也不会每轮新建标签页堆积对话页；绝不碰用户自己开的 DeepSeek 页。
+        let (target_id, ws_url) = cdp::dedicated_target(&ep, "ldeepseek", SITE_URL)?;
         let res = run_deepseek_tab(
             &ws_url,
             &url,
@@ -254,9 +257,8 @@ pub fn ask_web(
             ctx,
             on_text,
         );
-        if res.is_ok() {
-            cdp::close_target(&ep, &target_id);
-        }
+        // 专用页常驻，任何情况下都不关闭（关掉下次又要重新加载，退回竞态）
+        let _ = target_id;
         let (conv_id, text, reasoning) = res?;
         return Ok(json!({
             "site": "deepseek",
@@ -322,6 +324,18 @@ const SEND_BTN_JS: &str = r#"(() => {
     x: r.x + r.width / 2,
     y: r.y + r.height / 2,
   });
+})()"#;
+
+/// 唤醒虚拟列表：DeepSeek 新版前端用虚拟列表渲染消息，**后台标签页里列表不挂载**
+/// （实测 count 恒为 0，20 秒后误报「没有任何消息」），触发一次 resize + 滚动
+/// 就会把可见消息节点渲染出来。每轮采样前先 nudge，代价可忽略。
+const WAKE_LIST_JS: &str = r#"(() => {
+  window.dispatchEvent(new Event('resize'));
+  const sc = document.scrollingElement;
+  if (sc) { sc.scrollTop = sc.scrollHeight; }
+  const vl = document.querySelector('.ds-virtual-list');
+  if (vl) vl.dispatchEvent(new Event('scroll', { bubbles: true }));
+  return 'ok';
 })()"#;
 
 const SNAPSHOT_JS: &str = r#"(() => {
@@ -453,6 +467,38 @@ fn run_deepseek_tab(
             std::thread::sleep(Duration::from_millis(1200));
         }
     }
+    // 专用常驻页可能停在别的会话或首页：续接会话时导航过去；
+    // 首页场景若已在 DeepSeek 站内则不动页面，避免打断正在输入的草稿。
+    {
+        let current = client
+            .eval_js("location.href")
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        // 续接会话（target_url 带 /a/chat/s/）时导航过去；首页场景若已在
+        // DeepSeek 站内则不动页面，避免打断正在输入的草稿。
+        let is_chat = target_url.contains("/a/chat/s/");
+        let need = if is_chat {
+            !current.contains(target_url)
+        } else {
+            !current.contains("chat.deepseek.com")
+        };
+        if need {
+            client.navigate(target_url)?;
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline {
+                let now = client
+                    .eval_js("location.href")
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_default();
+                if now.contains("chat.deepseek.com") && now != "about:blank" {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+    }
     let deadline = Instant::now() + COMPOSER_TIMEOUT;
     let mut ready = false;
     while Instant::now() < deadline {
@@ -487,8 +533,16 @@ fn run_deepseek_tab(
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let before = client.eval_json(SNAPSHOT_JS).unwrap_or(Value::Null);
-    let before_count = before.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let before = {
+        let _ = client.eval_js(WAKE_LIST_JS);
+        std::thread::sleep(Duration::from_millis(300));
+        client.eval_json(SNAPSHOT_JS).unwrap_or(Value::Null)
+    };
+    let mut before_count = before.get("count").and_then(Value::as_u64).unwrap_or(0);
+    let before_conv: Option<String> = before
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     // 短提示走 CDP Input.insertText 触发最真实的 React 输入事件；长提示走 setter 避免卡顿
     if prompt.len() <= 2000 {
@@ -584,7 +638,7 @@ fn run_deepseek_tab(
     let mut eval_failures = 0u32;
     while Instant::now() < reply_deadline {
         match client.eval_json(SNAPSHOT_JS) {
-            Ok(snap) => {
+            Ok(mut snap) => {
                 eval_failures = 0;
                 if let Some(err) = snap.get("error").and_then(Value::as_str) {
                     if !err.trim().is_empty() {
@@ -594,20 +648,49 @@ fn run_deepseek_tab(
                         )));
                     }
                 }
+                // 后台标签页里虚拟列表不渲染消息（count 恒 0）——先唤醒再采样，
+                // 否则会把「已生成但没渲染」误报成 20 秒超时（2026-11-28 实测根因）。
+                // 唤醒到 React 挂载节点之间有延迟，等 600ms 后再采，必要时多试几轮。
+                let count0 = snap.get("count").and_then(Value::as_u64).unwrap_or(0);
+                if count0 == 0 {
+                    for _wake in 0..3 {
+                        let _ = client.eval_js(WAKE_LIST_JS);
+                        std::thread::sleep(Duration::from_millis(600));
+                        if let Ok(resnap) = client.eval_json(SNAPSHOT_JS) {
+                            let count2 = resnap.get("count").and_then(Value::as_u64).unwrap_or(0);
+                            if count2 > 0 {
+                                snap = resnap;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if let Some(cid) = snap.get("conversation_id").and_then(Value::as_str) {
+                    // 专用常驻页复用后残留上一轮会话的消息：新请求会跳到新会话页，
+                    // conv 一变就重置基线，否则 count==before_count 恒成立、
+                    // 新回答永远不满足 count > before_count 而被忽略（误报根因之二）。
+                    let new_conv = before_conv.as_deref().map(|b| b != cid).unwrap_or(false);
+                    if new_conv && conv_id.as_deref() != Some(cid) {
+                        before_count = 0;
+                    }
                     conv_id = Some(cid.to_string());
                 }
                 let count = snap.get("count").and_then(Value::as_u64).unwrap_or(0);
                 let txt = snap.get("text").and_then(Value::as_str).unwrap_or("");
                 let think = snap.get("think").and_then(Value::as_str).unwrap_or("");
-                if think.chars().count() > best_think.chars().count() {
-                    best_think = think.to_string();
-                }
                 let generating = snap
                     .get("generating")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if count > before_count && !txt.is_empty() {
+                // 接受条件：文本非空即为回答。专用常驻页里 before_count 会残留上一轮
+                // 会话消息条数，新会话的 count 常常相同，不能再卡 count > before_count；
+                // 发送按钮已点、会话 id 已出现，文本就是本次回答（content 里是 assistant
+                // 节点提取，天然不含侧栏/用户提问）。
+                let has_answer = !txt.trim().is_empty();
+                if has_answer {
+                    if think.chars().count() > best_think.chars().count() {
+                        best_think = think.to_string();
+                    }
                     if txt != best {
                         best = txt.to_string();
                         stable_ticks = 0;
@@ -644,9 +727,11 @@ fn run_deepseek_tab(
                 // 这种情况不能空等 240 秒，给用户一个可行动的错误。
                 if count == 0 && conv_id.is_some() {
                     empty_ticks += 1;
-                    if empty_ticks >= 16 {
+                    // 专用页首次加载时前端资源/虚拟列表初始化可能拖到 20 秒以上，
+                    // 给足 40 秒（32 tick）再判失败，避免把「慢启动」误报成限流。
+                    if empty_ticks >= 32 {
                         return Err(AppError::Runtime(
-                            "DeepSeek 会话已创建但约 20 秒内没有任何消息（可能被限流/审核/页面异常）；请稍后重试或换账号".to_string()
+                            "DeepSeek 会话已创建但约 40 秒内没有任何消息（可能被限流/审核/页面异常）；请稍后重试或换账号".to_string()
                         ));
                     }
                 } else {
